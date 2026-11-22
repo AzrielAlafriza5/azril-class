@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "DM Sans", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-lime-primary: #B5D45D;
+  --color-lime-bright: #C5E370;
+  --color-soft-mint: #F0F8DF;
+  --color-light-green: #DCECB8;
+  --color-border-mint: #D5E4B6;
+  --color-dark-card: #171A17;
+  --color-dark-elevated: #232822;
+  --color-ink-text: #20251D;
+  --color-lime-deep: #536F1A;
+  --color-lime-ink: #364B0F;
+}
+
+:root {
+  color-scheme: light;
+}
+
+html, body {
+  font-family: "Plus Jakarta Sans", "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  background-color: #F0F8DF;
+  color: #20251D;
+  overflow-x: hidden;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Lime Runner Progress Bar */
+@keyframes lime-runner {
+  0% {
+    transform: translateX(-100%);
+  }
+  50% {
+    transform: translateX(0%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.animate-lime-runner {
+  animation: lime-runner 1.3s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+/* Loading Sheen Effect */
+@keyframes loading-sheen {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton-sheen {
+  background: linear-gradient(
+    90deg,
+    #E6F1CE 0%,
+    #F5FBE8 45%,
+    #DCECB8 65%,
+    #E6F1CE 100%
+  );
+  background-size: 200% 100%;
+  animation: loading-sheen 1.6s ease-in-out infinite;
+}
+
+.skeleton-sheen-dark {
+  background: linear-gradient(
+    90deg,
+    #232822 0%,
+    #2F362D 50%,
+    #232822 100%
+  );
+  background-size: 200% 100%;
+  animation: loading-sheen 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-lime-runner,
+  .skeleton-sheen,
+  .skeleton-sheen-dark {
+    animation: none !important;
+  }
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
