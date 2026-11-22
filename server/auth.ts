@@ -221,18 +221,27 @@ export function hasAnyAdmin(): boolean {
 
 export function syncEnvBootstrapAdminIfNeeded(): void {
   const envPass = process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim();
-  const envUser = process.env.ADMIN_BOOTSTRAP_USERNAME?.trim() || 'admin';
-  const envEmail = process.env.ADMIN_BOOTSTRAP_EMAIL?.trim() || null;
+  const envUser = (process.env.ADMIN_BOOTSTRAP_USERNAME?.trim() || 'admin').toLowerCase();
+  const envEmail = process.env.ADMIN_BOOTSTRAP_EMAIL?.trim().toLowerCase() || null;
   if (!envPass) return;
 
-  const existing = db.prepare(`SELECT id FROM user_profiles WHERE role = 'ADMIN' LIMIT 1`).get() as
-    | { id: string }
+  const existing = db
+    .prepare(`SELECT id, username, email, password_hash FROM user_profiles WHERE role = 'ADMIN' LIMIT 1`)
+    .get() as
+    | { id: string; username: string; email: string | null; password_hash: string }
     | undefined;
-  const hash = hashPassword(envPass);
+
   if (existing) {
+    const nextEmail = envEmail ?? existing.email ?? null;
+    const sameUser = existing.username.toLowerCase() === envUser;
+    const sameEmail = (existing.email?.toLowerCase() ?? null) === nextEmail;
+    const samePass = verifyPassword(envPass, existing.password_hash);
+    if (sameUser && sameEmail && samePass) return;
+
+    const hash = samePass ? existing.password_hash : hashPassword(envPass);
     db.prepare(`UPDATE user_profiles SET username = ?, email = ?, password_hash = ?, updated_at = ? WHERE id = ?`).run(
       envUser,
-      envEmail,
+      nextEmail,
       hash,
       new Date().toISOString(),
       existing.id
@@ -241,6 +250,6 @@ export function syncEnvBootstrapAdminIfNeeded(): void {
     db.prepare(
       `INSERT INTO user_profiles (id, username, email, password_hash, full_name, role, is_active)
        VALUES (?, ?, ?, ?, 'Administrator Utama', 'ADMIN', 1)`
-    ).run(newId(), envUser, envEmail, hash);
+    ).run(newId(), envUser, envEmail, hashPassword(envPass));
   }
 }

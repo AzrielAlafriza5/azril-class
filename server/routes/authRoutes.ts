@@ -106,7 +106,7 @@ authRouter.post('/admin/login', (req, res) => {
     .prepare(
       `SELECT id, password_hash, role, is_active
        FROM user_profiles
-       WHERE (lower(username) = ? OR lower(email) = ?)
+       WHERE role = 'ADMIN' AND (lower(username) = ? OR lower(email) = ?)
        LIMIT 1`
     )
     .get(cleanId, cleanId) as
