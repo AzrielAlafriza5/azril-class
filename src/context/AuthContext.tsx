@@ -29,12 +29,6 @@ interface AuthContextValue {
   refreshUser: () => Promise<void>;
   refreshSystemStatus: () => Promise<void>;
   loginAdmin: (identifier: string, password: string) => Promise<AuthUser>;
-  bootstrapAdmin: (payload: {
-    username: string;
-    email?: string;
-    fullName: string;
-    password: string;
-  }) => Promise<AuthUser>;
   loginStudent: (username: string, password: string) => Promise<{
     user: AuthUser;
     loginReward?: { xpAwarded: number; streakBonusAwarded: number; currentStreak: number };
@@ -98,22 +92,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return res.user;
   };
 
-  const bootstrapAdmin = async (payload: {
-    username: string;
-    email?: string;
-    fullName: string;
-    password: string;
-  }) => {
-    const res = await apiRequest<{ token: string; user: AuthUser }>('/api/auth/admin/bootstrap', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    setAuthToken(res.token);
-    setUser(res.user);
-    await refreshSystemStatus();
-    return res.user;
-  };
-
   const loginStudent = async (username: string, password: string) => {
     const res = await apiRequest<{
       token: string;
@@ -150,7 +128,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         refreshUser,
         refreshSystemStatus,
         loginAdmin,
-        bootstrapAdmin,
         loginStudent,
         logout,
       }}

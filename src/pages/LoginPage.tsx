@@ -4,7 +4,7 @@ import { useAuth } from '../context/AuthContext';
 import { PWAInstallButton } from '../components/ui/PWAInstallButton';
 
 export const LoginPage: React.FC = () => {
-  const { systemStatus, loginAdmin, bootstrapAdmin, loginStudent, pushToast } = useAuth();
+  const { systemStatus, loginAdmin, loginStudent, pushToast } = useAuth();
   const [portal, setPortal] = useState<'MAHASISWA' | 'ADMIN'>('MAHASISWA');
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -17,15 +17,6 @@ export const LoginPage: React.FC = () => {
   // Admin login state
   const [adminIdentifier, setAdminIdentifier] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
-
-  // First-run Admin Claim state (only shown if no admin exists yet)
-  const [claimUsername, setClaimUsername] = useState('admin');
-  const [claimEmail, setClaimEmail] = useState('');
-  const [claimFullName, setClaimFullName] = useState('Administrator AZRIL CLAS');
-  const [claimPassword, setClaimPassword] = useState('');
-
-  const needsAdminClaim =
-    portal === 'ADMIN' && systemStatus && !systemStatus.hasAdmin && !systemStatus.envBootstrapConfigured;
 
   const handleStudentSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -67,29 +58,6 @@ export const LoginPage: React.FC = () => {
       pushToast({ type: 'success', title: 'Login Admin berhasil — sesi tetap aktif di perangkat ini' });
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Gagal masuk sebagai Admin.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleAdminBootstrap = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMsg(null);
-    setSubmitting(true);
-    try {
-      await bootstrapAdmin({
-        username: claimUsername.trim(),
-        email: claimEmail.trim() || undefined,
-        fullName: claimFullName.trim(),
-        password: claimPassword,
-      });
-      pushToast({
-        type: 'success',
-        title: 'Akun Admin Utama Berhasil Dibuat',
-        description: 'Anda sekarang masuk ke Dashboard Admin AZRIL CLAS.',
-      });
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Gagal membuat akun Admin awal.');
     } finally {
       setSubmitting(false);
     }
@@ -264,90 +232,12 @@ export const LoginPage: React.FC = () => {
                 Akun mahasiswa dikelola penuh oleh Admin. Hubungi Admin jika Anda memerlukan bantuan atau reset akun.
               </p>
             </form>
-          ) : needsAdminClaim ? (
-            <form onSubmit={handleAdminBootstrap} className="space-y-4">
-              <div>
-                <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#536F1A] mb-1">
-                  <ShieldCheck className="w-4 h-4" />
-                  Aktivasi Pertama Kali
-                </div>
-                <h2 className="text-xl font-bold text-[#20251D]">Buat Akun Admin Utama</h2>
-                <p className="text-xs text-[#536F1A] mt-1">
-                  Database baru belum memiliki akun Admin. Klaim akun Admin pertama untuk mengelola sistem.
-                </p>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold mb-1">Username Admin</label>
-                  <input
-                    type="text"
-                    required
-                    value={claimUsername}
-                    onChange={(e) => setClaimUsername(e.target.value)}
-                    className="w-full rounded-full border border-[#D5E4B6] px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#B5D45D]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold mb-1">Email (Opsional)</label>
-                  <input
-                    type="email"
-                    value={claimEmail}
-                    onChange={(e) => setClaimEmail(e.target.value)}
-                    placeholder="admin@kampus.ac.id"
-                    className="w-full rounded-full border border-[#D5E4B6] px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#B5D45D]"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold mb-1">Nama Lengkap</label>
-                <input
-                  type="text"
-                  required
-                  value={claimFullName}
-                  onChange={(e) => setClaimFullName(e.target.value)}
-                  className="w-full rounded-full border border-[#D5E4B6] px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#B5D45D]"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold mb-1">Password Admin (min. 6 karakter)</label>
-                <div className="relative">
-                  <input
-                    type={showPassword ? 'text' : 'password'}
-                    required
-                    minLength={6}
-                    value={claimPassword}
-                    onChange={(e) => setClaimPassword(e.target.value)}
-                    placeholder="Buat password yang kuat"
-                    className="w-full rounded-full border border-[#D5E4B6] px-4 pr-11 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#B5D45D]"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword((v) => !v)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-[#536F1A]"
-                    aria-label="Toggle password"
-                  >
-                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={submitting}
-                className="w-full rounded-full bg-[#B5D45D] hover:bg-[#C5E370] text-[#171A17] font-bold py-3.5 text-sm transition-colors min-h-[48px]"
-              >
-                {submitting ? 'Membuat Akun...' : 'Aktifkan & Masuk Dashboard Admin'}
-              </button>
-            </form>
           ) : (
             <form onSubmit={handleAdminSubmit} className="space-y-5">
               <div>
                 <h2 className="text-xl font-bold text-[#20251D]">Masuk Konsol Admin</h2>
                 <p className="text-xs text-[#536F1A] mt-1">
-                  Akses khusus pengelola akademik. Cukup login satu kali — sesi tetap aktif sampai Anda keluar.
+                  Akses khusus pengelola akademik tunggal. Cukup login satu kali — sesi tetap aktif sampai Anda keluar.
                 </p>
               </div>
 
@@ -363,7 +253,7 @@ export const LoginPage: React.FC = () => {
                     autoComplete="username"
                     value={adminIdentifier}
                     onChange={(e) => setAdminIdentifier(e.target.value)}
-                    placeholder="admin atau email@kampus.ac.id"
+                    placeholder="azriel-admin atau azrilalafriza5@gmail.com"
                     className="w-full rounded-full border border-[#D5E4B6] bg-[#F0F8DF]/40 pl-11 pr-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#B5D45D]"
                   />
                 </div>

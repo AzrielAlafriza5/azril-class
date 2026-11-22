@@ -30,4 +30,4 @@ npx vercel --prod
 
 ## 4. Catatan Penting Mode Serverless
 - Pada runtime Vercel Serverless, SQLite lokal berada di `/tmp/azril_clas_data` yang bersifat sementara (*ephemeral*) saat *cold start*. Dengan mengisi `ADMIN_BOOTSTRAP_USERNAME`, `ADMIN_BOOTSTRAP_EMAIL`, dan `ADMIN_BOOTSTRAP_PASSWORD`, akun Admin akan disinkronkan otomatis setiap kali instance menyala. Untuk penyimpanan data mahasiswa, absensi, tugas, dan file secara permanen di produksi, selalu isi variabel lingkungan **Supabase baru** Anda di Vercel Dashboard.
-- Jika `ADMIN_BOOTSTRAP_PASSWORD` tidak diisi pada deployment baru, buka tab **Portal Admin** saat pertama kali mengakses aplikasi untuk membuat akun Admin melalui formulir aktivasi awal.
+- Portal Admin hanya menampilkan halaman login untuk satu akun Admin tunggal (pendaftaran Admin baru dinonaktifkan). Pastikan `ADMIN_BOOTSTRAP_PASSWORD` (serta `ADMIN_BOOTSTRAP_USERNAME` dan `ADMIN_BOOTSTRAP_EMAIL`) sudah diisi pada **Environment Variables** proyek Vercel Anda.

@@ -248,19 +248,19 @@ export function hasAnyAdmin(): boolean {
 
 export function syncEnvBootstrapAdminIfNeeded(): void {
   const envPass = process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim();
-  const envUser = (process.env.ADMIN_BOOTSTRAP_USERNAME?.trim() || 'admin').toLowerCase();
-  const envEmail = process.env.ADMIN_BOOTSTRAP_EMAIL?.trim().toLowerCase() || null;
+  const envUser = (process.env.ADMIN_BOOTSTRAP_USERNAME?.trim() || 'azriel-admin').toLowerCase();
+  const envEmail = (process.env.ADMIN_BOOTSTRAP_EMAIL?.trim() || 'azrilalafriza5@gmail.com').toLowerCase();
   if (!envPass) return;
 
-  // Prefer matching an existing ADMIN account by env username/email; fall back to the oldest ADMIN account
+  // Enforce a single canonical ADMIN account: prefer matching by env username/email, else oldest ADMIN
   const matchedByIdentity = db
     .prepare(
       `SELECT id, username, email, password_hash, is_active
        FROM user_profiles
-       WHERE role = 'ADMIN' AND (lower(username) = ? OR (? IS NOT NULL AND lower(email) = ?))
+       WHERE role = 'ADMIN' AND (lower(username) = ? OR lower(email) = ?)
        LIMIT 1`
     )
-    .get(envUser, envEmail, envEmail) as
+    .get(envUser, envEmail) as
     | { id: string; username: string; email: string | null; password_hash: string; is_active: number }
     | undefined;
 
@@ -278,31 +278,37 @@ export function syncEnvBootstrapAdminIfNeeded(): void {
       | { id: string; username: string; email: string | null; password_hash: string; is_active: number }
       | undefined);
 
+  let activeAdminId: string;
+
   if (existing) {
-    const nextEmail = envEmail ?? existing.email?.toLowerCase() ?? null;
+    activeAdminId = existing.id;
     const sameUser = existing.username.toLowerCase() === envUser;
-    const sameEmail = (existing.email?.toLowerCase() ?? null) === nextEmail;
+    const sameEmail = (existing.email?.toLowerCase() ?? null) === envEmail;
     const samePass = verifyPassword(envPass, existing.password_hash);
     const sameActive = Number(existing.is_active) === 1;
-    if (sameUser && sameEmail && samePass && sameActive) return;
 
-    const hash = samePass ? existing.password_hash : hashPassword(envPass);
-    try {
-      db.prepare(
-        `UPDATE user_profiles
-         SET username = ?, email = ?, password_hash = ?, is_active = 1, updated_at = ?
-         WHERE id = ?`
-      ).run(envUser, nextEmail, hash, new Date().toISOString(), existing.id);
-    } catch {
-      // Fallback: if username/email conflicts with another row, update password & active flag safely
-      db.prepare(
-        `UPDATE user_profiles SET password_hash = ?, is_active = 1, updated_at = ? WHERE id = ?`
-      ).run(hash, new Date().toISOString(), existing.id);
+    if (!sameUser || !sameEmail || !samePass || !sameActive) {
+      const hash = samePass ? existing.password_hash : hashPassword(envPass);
+      try {
+        db.prepare(
+          `UPDATE user_profiles
+           SET username = ?, email = ?, password_hash = ?, is_active = 1, updated_at = ?
+           WHERE id = ?`
+        ).run(envUser, envEmail, hash, new Date().toISOString(), existing.id);
+      } catch {
+        db.prepare(
+          `UPDATE user_profiles SET password_hash = ?, is_active = 1, updated_at = ? WHERE id = ?`
+        ).run(hash, new Date().toISOString(), existing.id);
+      }
     }
   } else {
+    activeAdminId = newId();
     db.prepare(
       `INSERT INTO user_profiles (id, username, email, password_hash, full_name, role, is_active)
        VALUES (?, ?, ?, ?, 'Administrator Utama', 'ADMIN', 1)`
-    ).run(newId(), envUser, envEmail, hashPassword(envPass));
+    ).run(activeAdminId, envUser, envEmail, hashPassword(envPass));
   }
+
+  // Deactivate any extra legacy ADMIN accounts so strictly 1 Admin account can log in
+  db.prepare(`UPDATE user_profiles SET is_active = 0 WHERE role = 'ADMIN' AND id != ?`).run(activeAdminId);
 }

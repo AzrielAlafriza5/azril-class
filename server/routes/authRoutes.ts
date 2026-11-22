@@ -6,8 +6,6 @@ import {
   extractTokenFromRequest,
   getUserById,
   hasAnyAdmin,
-  hashPassword,
-  logAdminActivity,
   requireAuth,
   revokeSession,
   setSessionCookie,
@@ -15,7 +13,7 @@ import {
   verifyPassword,
   type AuthenticatedRequest,
 } from '../auth.ts';
-import { db, isSupabaseConfigured, newId, withTransaction } from '../db/database.ts';
+import { db, isSupabaseConfigured, withTransaction } from '../db/database.ts';
 import { isGeminiConfigured } from '../services/aiService.ts';
 import { awardDailyLoginAndStreak } from '../services/xpService.ts';
 
@@ -36,62 +34,10 @@ authRouter.get('/status', (_req, res) => {
   });
 });
 
-authRouter.post('/admin/bootstrap', (req, res) => {
-  if (hasAnyAdmin() || process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()) {
-    res.status(409).json({ error: 'Akun Admin awal sudah diklaim atau dikunci oleh konfigurasi server.' });
-    return;
-  }
-
-  const { username, email, fullName, password } = req.body as {
-    username?: string;
-    email?: string;
-    fullName?: string;
-    password?: string;
-  };
-
-  const cleanUsername = (username ?? '').trim().toLowerCase();
-  const cleanEmail = (email ?? '').trim().toLowerCase() || null;
-  const cleanName = (fullName ?? '').trim();
-  const rawPass = password ?? '';
-
-  if (cleanUsername.length < 3 || !/^[a-z0-9._-]+$/.test(cleanUsername)) {
-    res.status(400).json({ error: 'Username minimal 3 karakter (huruf kecil, angka, titik, garis bawah).' });
-    return;
-  }
-  if (cleanName.length < 2) {
-    res.status(400).json({ error: 'Nama lengkap Admin wajib diisi.' });
-    return;
-  }
-  if (rawPass.length < 6) {
-    res.status(400).json({ error: 'Password minimal 6 karakter.' });
-    return;
-  }
-
-  try {
-    const adminId = withTransaction(() => {
-      if (hasAnyAdmin()) {
-        throw new Error('ALREADY_CLAIMED');
-      }
-      const id = newId();
-      db.prepare(
-        `INSERT INTO user_profiles (id, username, email, password_hash, full_name, role, is_active, last_login_at)
-         VALUES (?, ?, ?, ?, ?, 'ADMIN', 1, ?)`
-      ).run(id, cleanUsername, cleanEmail, hashPassword(rawPass), cleanName, new Date().toISOString());
-      logAdminActivity(id, 'ADMIN_BOOTSTRAP', 'user_profiles', id, { username: cleanUsername });
-      return id;
-    });
-
-    const { token, expiresAtUtc } = createSession(adminId, 'ADMIN');
-    setSessionCookie(res, token, expiresAtUtc, req);
-    const user = getUserById(adminId);
-    res.status(201).json({ token, expiresAtUtc, user });
-  } catch (err) {
-    if (err instanceof Error && err.message === 'ALREADY_CLAIMED') {
-      res.status(409).json({ error: 'Akun Admin sudah dibuat.' });
-      return;
-    }
-    res.status(500).json({ error: 'Gagal membuat akun Admin awal.' });
-  }
+authRouter.post('/admin/bootstrap', (_req, res) => {
+  res.status(403).json({
+    error: 'Pendaftaran akun Admin dinonaktifkan. Portal Admin hanya menggunakan satu akun Admin resmi.',
+  });
 });
 
 authRouter.post('/admin/login', (req, res) => {
@@ -124,11 +70,16 @@ authRouter.post('/admin/login', (req, res) => {
   const isNonProd = process.env.NODE_ENV !== 'production';
 
   if (!row) {
+    if (!hasAnyAdmin() && !process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()) {
+      res.status(401).json({
+        error: 'Akun Admin belum dikonfigurasi di server. Pastikan ADMIN_BOOTSTRAP_PASSWORD sudah disetel di Secrets / Environment Variables.',
+      });
+      return;
+    }
     if (isNonProd) {
-      const msg = hasAnyAdmin()
-        ? 'Kredensial Admin tidak valid (username/email Admin tidak ditemukan).'
-        : 'Akun Admin belum dibuat atau belum dikonfigurasi di server.';
-      res.status(401).json({ error: msg });
+      res.status(401).json({
+        error: 'Kredensial Admin tidak valid (username/email Admin tidak ditemukan).',
+      });
     } else {
       res.status(401).json({ error: 'Kredensial Admin tidak valid.' });
     }
