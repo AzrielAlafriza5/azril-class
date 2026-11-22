@@ -184,7 +184,7 @@ CREATE TABLE IF NOT EXISTS public.attendance_records (
 CREATE TABLE IF NOT EXISTS public.historical_attendance (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   student_id UUID NOT NULL REFERENCES public.students(id) ON DELETE CASCADE,
-  week_number SMALLINT NOT NULL CHECK (week_number BETWEEN 1 AND 8),
+  week_number SMALLINT NOT NULL CHECK (week_number >= 1),
   status attendance_status NOT NULL DEFAULT 'Alfa',
   xp_awarded INTEGER NOT NULL DEFAULT 0,
   imported_by_admin_id UUID REFERENCES public.user_profiles(id) ON DELETE SET NULL,

@@ -17,6 +17,9 @@ export interface ParsedExcelRow {
   skipBlack: boolean;
   isDuplicateInFile: boolean;
   existsInDb: boolean;
+  newWeeksCount: number;
+  existingWeeksCount: number;
+  willSkipExisting: boolean;
   validationError: string | null;
   historicalWeeks: Partial<Record<number, AttendanceStatus>>;
 }
@@ -29,12 +32,17 @@ export interface ParsedWorkbookPreview {
     suggestedProdiId: string | null;
     totalRows: number;
     validRows: number;
+    newStudentRows: number;
+    existingWithNewWeeksRows: number;
+    skippedExistingRows: number;
     afkRows: number;
     skippedBlackRows: number;
     duplicateRows: number;
     invalidRows: number;
+    detectedWeeks: number[];
   }[];
   rows: ParsedExcelRow[];
+  detectedWeeks: number[];
   ignoredSheets: { sheetName: string; reason: string }[];
 }
 
@@ -119,17 +127,13 @@ function matchHeaderKey(rawHeader: string): string | null {
   if (text.includes('angkatan') || text.includes('cohort') || text === 'tahun masuk') return 'cohort';
   if (text.includes('semester') || text === 'smt' || text === 'smst') return 'semester';
 
+  // Match unlimited attendance weeks: M1..M200, Minggu 1.., W1.., Week 1.., Pertemuan 1.., Pert 1.., P1.., Sesi 1.., Ke-1..
   const compact = text.replace(/\s+/g, '');
-  for (let w = 1; w <= 8; w++) {
-    if (
-      compact === `m${w}` ||
-      compact === `minggu${w}` ||
-      compact === `w${w}` ||
-      compact === `week${w}` ||
-      compact === `pertemuan${w}` ||
-      compact === `p${w}`
-    ) {
-      return `w${w}`;
+  const weekMatch = compact.match(/^(?:m|minggu|w|week|pertemuan|pert|p|sesi|ke)(\d+)$/);
+  if (weekMatch) {
+    const num = Number(weekMatch[1]);
+    if (Number.isInteger(num) && num >= 1 && num <= 200) {
+      return `w${num}`;
     }
   }
   return null;
@@ -190,10 +194,26 @@ export async function parseStudentImportWorkbook(
   const existingNims = new Set(
     (db.prepare(`SELECT nim FROM students`).all() as { nim: string }[]).map((r) => r.nim.toUpperCase())
   );
+  const existingWeeksByNim = new Map<string, Set<number>>();
+  const existingHistRows = db
+    .prepare(
+      `SELECT upper(s.nim) AS nim_key, ha.week_number
+       FROM historical_attendance ha
+       JOIN students s ON s.id = ha.student_id`
+    )
+    .all() as { nim_key: string; week_number: number }[];
+  for (const hr of existingHistRows) {
+    if (!existingWeeksByNim.has(hr.nim_key)) {
+      existingWeeksByNim.set(hr.nim_key, new Set());
+    }
+    existingWeeksByNim.get(hr.nim_key)!.add(Number(hr.week_number));
+  }
+
   const seenNims = new Set<string>();
 
   const sheets: ParsedWorkbookPreview['sheets'] = [];
   const rows: ParsedExcelRow[] = [];
+  const allDetectedWeeks = new Set<number>();
   const ignoredSheets: ParsedWorkbookPreview['ignoredSheets'] = [];
 
   for (const ws of workbook.worksheets) {
@@ -230,6 +250,18 @@ export async function parseStudentImportWorkbook(
       continue;
     }
 
+    const weekCols: Array<{ weekNumber: number; colNumber: number }> = [];
+    for (const [k, cIdx] of Object.entries(colMap)) {
+      if (k.startsWith('w')) {
+        const num = Number(k.slice(1));
+        if (Number.isInteger(num) && num >= 1) {
+          weekCols.push({ weekNumber: num, colNumber: cIdx });
+          allDetectedWeeks.add(num);
+        }
+      }
+    }
+    weekCols.sort((a, b) => a.weekNumber - b.weekNumber);
+
     const matchedClass = classes.find(
       (c) => c.name.toLowerCase() === ws.name.trim().toLowerCase() || wsLower.includes(c.name.toLowerCase())
     );
@@ -239,6 +271,9 @@ export async function parseStudentImportWorkbook(
 
     let totalRows = 0;
     let validRows = 0;
+    let newStudentRows = 0;
+    let existingWithNewWeeksRows = 0;
+    let skippedExistingRows = 0;
     let afkRows = 0;
     let skippedBlackRows = 0;
     let duplicateRows = 0;
@@ -252,7 +287,7 @@ export async function parseStudentImportWorkbook(
 
       totalRows += 1;
 
-      // Check fill colors across key columns (NIM, Name, or columns 1..6)
+      // Check fill colors across key columns (NIM, Name, or columns 1..3)
       let colorFlag: 'RED' | 'BLACK' | 'OTHER' = 'OTHER';
       const checkCols = Array.from(new Set([colMap.nim, colMap.name, 1, 2, 3]));
       for (const cIdx of checkCols) {
@@ -273,16 +308,15 @@ export async function parseStudentImportWorkbook(
       const usernameRaw = colMap.username ? cellToString(row.getCell(colMap.username).value) : '';
       const passwordRaw = colMap.password ? cellToString(row.getCell(colMap.password).value) : '';
       const cohortRaw = colMap.cohort ? Number(cellToString(row.getCell(colMap.cohort).value)) : 2026;
-      const semRaw = colMap.semester ? Number(cellToString(row.getCell(colMap.semester).value)) : 1;
+      const semText = colMap.semester ? cellToString(row.getCell(colMap.semester).value) : '';
+      const semMatch = semText.match(/\d+/);
+      const semRaw = semMatch ? Number(semMatch[0]) : 1;
 
       const historicalWeeks: Partial<Record<number, AttendanceStatus>> = {};
-      for (let w = 1; w <= 8; w++) {
-        const cIdx = colMap[`w${w}`];
-        if (cIdx) {
-          const parsedStatus = normalizeAttendanceValue(cellToString(row.getCell(cIdx).value));
-          if (parsedStatus) {
-            historicalWeeks[w] = parsedStatus;
-          }
+      for (const wc of weekCols) {
+        const parsedStatus = normalizeAttendanceValue(cellToString(row.getCell(wc.colNumber).value));
+        if (parsedStatus) {
+          historicalWeeks[wc.weekNumber] = parsedStatus;
         }
       }
 
@@ -302,11 +336,28 @@ export async function parseStudentImportWorkbook(
       }
       const existsInDb = !skipBlack && nimClean !== '' && existingNims.has(nimKey);
 
+      const recordedWeeksInDb = existingWeeksByNim.get(nimKey);
+      let newWeeksCount = 0;
+      let existingWeeksCount = 0;
+      for (const weekStr of Object.keys(historicalWeeks)) {
+        const wNum = Number(weekStr);
+        if (existsInDb && recordedWeeksInDb?.has(wNum)) {
+          existingWeeksCount += 1;
+        } else {
+          newWeeksCount += 1;
+        }
+      }
+      const willSkipExisting = !skipBlack && !validationError && !isDuplicateInFile && existsInDb && newWeeksCount === 0;
+
       if (skipBlack) skippedBlackRows += 1;
       else if (validationError) invalidRows += 1;
       else if (isDuplicateInFile) duplicateRows += 1;
-      else {
+      else if (willSkipExisting) {
+        skippedExistingRows += 1;
+      } else {
         validRows += 1;
+        if (existsInDb) existingWithNewWeeksRows += 1;
+        else newStudentRows += 1;
         if (badge === 'AFK') afkRows += 1;
       }
 
@@ -323,6 +374,9 @@ export async function parseStudentImportWorkbook(
         skipBlack,
         isDuplicateInFile,
         existsInDb,
+        newWeeksCount,
+        existingWeeksCount,
+        willSkipExisting,
         validationError,
         historicalWeeks,
       });
@@ -335,14 +389,23 @@ export async function parseStudentImportWorkbook(
       suggestedProdiId: matchedClass?.study_program_id ?? matchedProdi?.id ?? null,
       totalRows,
       validRows,
+      newStudentRows,
+      existingWithNewWeeksRows,
+      skippedExistingRows,
       afkRows,
       skippedBlackRows,
       duplicateRows,
       invalidRows,
+      detectedWeeks: weekCols.map((w) => w.weekNumber),
     });
   }
 
-  return { sheets, rows, ignoredSheets };
+  return {
+    sheets,
+    rows,
+    detectedWeeks: Array.from(allDetectedWeeks).sort((a, b) => a - b),
+    ignoredSheets,
+  };
 }
 
 export async function buildStudentTemplateWorkbook(): Promise<Buffer> {
@@ -350,15 +413,25 @@ export async function buildStudentTemplateWorkbook(): Promise<Buffer> {
   const guide = wb.addWorksheet('Panduan Import');
   guide.columns = [
     { header: 'Aturan Import Excel AZRIL CLAS', key: 'rule', width: 42 },
-    { header: 'Penjelasan', key: 'desc', width: 70 },
+    { header: 'Penjelasan', key: 'desc', width: 78 },
   ];
   guide.addRows([
     { rule: 'Multi-Sheet', desc: 'Setiap sheet mewakili satu Kelas (contoh: HES-1A, PJKR-1A).' },
     { rule: 'Warna Merah (AFK)', desc: 'Baris dengan fill merah otomatis ditandai badge AFK.' },
     { rule: 'Blok Hitam (Dilewati)', desc: 'Baris dengan fill hitam akan dilewati saat import.' },
     { rule: 'Warna Lain', desc: 'Warna selain merah/hitam tidak digunakan sebagai indikator AFK.' },
-    { rule: 'Histori Minggu 1-8', desc: 'Isi kolom Minggu 1 s.d. Minggu 8 dengan H (Hadir), I (Izin), S (Sakit), atau A (Alfa).' },
-    { rule: 'Akun Mahasiswa', desc: 'Jika Username/Password dikosongkan, otomatis menggunakan NIM (segera ubah melalui Manajemen Akun jika perlu).' },
+    {
+      rule: 'Kolom Minggu Tanpa Batas',
+      desc: 'Tambahkan kolom Minggu 1, Minggu 2, ..., Minggu 9, Minggu 10, dst (atau M1, M9, W10, Pertemuan 12) sesuai kebutuhan. Isi dengan H, I, S, atau A.',
+    },
+    {
+      rule: 'Import Bertahap (Data Lama Tidak Ditimpa)',
+      desc: 'Saat mengimpor ulang di minggu berikutnya, mahasiswa dan minggu absensi yang sudah tersimpan otomatis dilewati. Hanya mahasiswa baru dan minggu absensi baru yang diinput.',
+    },
+    {
+      rule: 'Akun Mahasiswa',
+      desc: 'Jika Username/Password dikosongkan, otomatis menggunakan NIM (segera ubah melalui Manajemen Akun jika perlu).',
+    },
   ]);
 
   const template = wb.addWorksheet('Contoh Kelas');
@@ -377,6 +450,8 @@ export async function buildStudentTemplateWorkbook(): Promise<Buffer> {
     { header: 'Minggu 6', key: 'm6', width: 11 },
     { header: 'Minggu 7', key: 'm7', width: 11 },
     { header: 'Minggu 8', key: 'm8', width: 11 },
+    { header: 'Minggu 9', key: 'm9', width: 11 },
+    { header: 'Minggu 10', key: 'm10', width: 11 },
   ];
   template.getRow(1).font = { bold: true };
   const buffer = await wb.xlsx.writeBuffer();

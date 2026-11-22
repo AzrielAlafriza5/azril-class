@@ -183,14 +183,17 @@ export const StudentAttendancePage: React.FC = () => {
         </section>
       )}
 
-      {/* Histori Minggu 1-8 */}
+      {/* Histori Mingguan */}
       <section className="rounded-2xl bg-white border border-[#D5E4B6] p-5 space-y-3">
-        <h3 className="text-sm font-bold text-[#20251D]">Histori Absensi Minggu 1–8</h3>
+        <h3 className="text-sm font-bold text-[#20251D]">Histori Absensi Mingguan</h3>
         {historical.length === 0 ? (
-          <p className="text-xs text-[#536F1A]">Belum ada data histori Minggu 1–8.</p>
+          <p className="text-xs text-[#536F1A]">Belum ada data histori absensi mingguan.</p>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2.5">
-            {[1, 2, 3, 4, 5, 6, 7, 8].map((w) => {
+            {Array.from(
+              { length: Math.max(8, ...historical.map((h) => h.week_number)) },
+              (_, idx) => idx + 1
+            ).map((w) => {
               const found = historical.find((h) => h.week_number === w);
               return (
                 <div key={w} className="rounded-xl bg-[#F0F8DF] border border-[#D5E4B6] p-3 text-center">

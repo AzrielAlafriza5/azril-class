@@ -103,6 +103,14 @@ export const AdminAttendancePage: React.FC = () => {
 
   // Historical edits
   const [histEdits, setHistEdits] = useState<Record<string, AttendanceStatus>>({});
+  const [extraHistWeeks, setExtraHistWeeks] = useState(8);
+
+  const maxRecordedWeek = historical.reduce((max, row) => {
+    const rowMax = Object.keys(row.weeks).reduce((m, w) => Math.max(m, Number(w) || 0), 0);
+    return Math.max(max, rowMax);
+  }, 8);
+  const totalHistWeeks = Math.max(8, maxRecordedWeek, extraHistWeeks);
+  const histWeekNumbers = Array.from({ length: totalHistWeeks }, (_, i) => i + 1);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -226,7 +234,7 @@ export const AdminAttendancePage: React.FC = () => {
       });
       pushToast({
         type: 'success',
-        title: 'Histori Minggu 1–8 & XP Historis Dikalkulasi',
+        title: 'Histori Mingguan & XP Historis Dikalkulasi',
         description: `${res.studentsRecalculated} mahasiswa diperbarui.`,
       });
       setHistEdits({});
@@ -268,7 +276,7 @@ export const AdminAttendancePage: React.FC = () => {
               tab === 'historical' ? 'bg-[#171A17] text-[#B5D45D]' : 'text-[#536F1A]'
             }`}
           >
-            Histori Minggu 1–8
+            Histori Mingguan ({totalHistWeeks})
           </button>
         </div>
 
@@ -411,6 +419,15 @@ export const AdminAttendancePage: React.FC = () => {
 
             <button
               type="button"
+              onClick={() => setExtraHistWeeks(totalHistWeeks + 1)}
+              className="inline-flex items-center gap-1.5 rounded-full border border-[#D5E4B6] bg-white hover:bg-[#F0F8DF] px-4 py-2 text-xs font-semibold"
+            >
+              <Plus className="w-3.5 h-3.5 text-[#536F1A]" />
+              Tambah Kolom M{totalHistWeeks + 1}
+            </button>
+
+            <button
+              type="button"
               onClick={() => void handleSaveHistorical()}
               className="inline-flex items-center gap-1.5 rounded-full bg-[#B5D45D] hover:bg-[#C5E370] text-[#171A17] px-5 py-2 text-xs font-bold"
             >
@@ -424,7 +441,7 @@ export const AdminAttendancePage: React.FC = () => {
               <thead className="bg-[#F0F8DF] border-b border-[#D5E4B6] font-semibold text-[#364B0F]">
                 <tr>
                   <th className="px-3 py-3">Mahasiswa</th>
-                  {[1, 2, 3, 4, 5, 6, 7, 8].map((w) => (
+                  {histWeekNumbers.map((w) => (
                     <th key={w} className="px-2 py-3 text-center">
                       M{w}
                     </th>
@@ -440,7 +457,7 @@ export const AdminAttendancePage: React.FC = () => {
                         {st.nim} · {st.class_name}
                       </p>
                     </td>
-                    {[1, 2, 3, 4, 5, 6, 7, 8].map((w) => {
+                    {histWeekNumbers.map((w) => {
                       const editKey = `${st.id}:${w}`;
                       const cur = histEdits[editKey] ?? st.weeks[w]?.status ?? '';
                       return (

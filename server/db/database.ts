@@ -199,7 +199,7 @@ export function initDatabase(): void {
     CREATE TABLE IF NOT EXISTS historical_attendance (
       id TEXT PRIMARY KEY,
       student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-      week_number INTEGER NOT NULL CHECK (week_number BETWEEN 1 AND 8),
+      week_number INTEGER NOT NULL CHECK (week_number >= 1),
       status TEXT NOT NULL DEFAULT 'Alfa' CHECK (status IN ('Hadir', 'Izin', 'Sakit', 'Alfa')),
       xp_awarded INTEGER NOT NULL DEFAULT 0,
       imported_by_admin_id TEXT REFERENCES user_profiles(id) ON DELETE SET NULL,
@@ -433,5 +433,37 @@ export function initDatabase(): void {
   );
   for (const p of defaultProdis) {
     insertProdi.run(newId(), p.code, p.name, p.faculty, p.degree_level, p.class_quota);
+  }
+
+  // Migrate existing SQLite historical_attendance table if it still enforces BETWEEN 1 AND 8
+  const histTableSql = (
+    db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'historical_attendance'`)
+      .get() as { sql?: string } | undefined
+  )?.sql;
+  if (histTableSql && /BETWEEN\s+1\s+AND\s+8/i.test(histTableSql)) {
+    db.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      withTransaction(() => {
+        db.exec(`
+          CREATE TABLE historical_attendance_migrated (
+            id TEXT PRIMARY KEY,
+            student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            week_number INTEGER NOT NULL CHECK (week_number >= 1),
+            status TEXT NOT NULL DEFAULT 'Alfa' CHECK (status IN ('Hadir', 'Izin', 'Sakit', 'Alfa')),
+            xp_awarded INTEGER NOT NULL DEFAULT 0,
+            imported_by_admin_id TEXT REFERENCES user_profiles(id) ON DELETE SET NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (student_id, week_number)
+          );
+          INSERT INTO historical_attendance_migrated (id, student_id, week_number, status, xp_awarded, imported_by_admin_id, updated_at)
+          SELECT id, student_id, week_number, status, xp_awarded, imported_by_admin_id, updated_at FROM historical_attendance;
+          DROP TABLE historical_attendance;
+          ALTER TABLE historical_attendance_migrated RENAME TO historical_attendance;
+        `);
+      });
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON;');
+    }
   }
 }

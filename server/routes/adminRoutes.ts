@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { Router } from 'express';
 import multer from 'multer';
@@ -662,19 +663,87 @@ adminRouter.patch('/students/:id/account', (req: AuthenticatedRequest, res) => {
   }
 });
 
+function cleanupStudentUploadedFiles(studentIds: string[]): void {
+  if (studentIds.length === 0) return;
+  const placeholders = studentIds.map(() => '?').join(',');
+  const subPaths = db
+    .prepare(
+      `SELECT storage_path FROM assignment_submissions WHERE student_id IN (${placeholders}) AND storage_path != ''
+       UNION
+       SELECT sr.storage_path FROM submission_revisions sr
+       JOIN assignment_submissions sub ON sub.id = sr.submission_id
+       WHERE sub.student_id IN (${placeholders}) AND sr.storage_path != ''`
+    )
+    .all(...studentIds, ...studentIds) as { storage_path: string }[];
+
+  const baseDir = path.resolve(UPLOADS_DIR);
+  for (const row of subPaths) {
+    const resolved = path.resolve(row.storage_path);
+    if (resolved.startsWith(baseDir + path.sep)) {
+      try {
+        if (fs.existsSync(resolved)) fs.unlinkSync(resolved);
+      } catch {
+        // ignore missing or locked upload files
+      }
+    }
+  }
+}
+
 adminRouter.delete('/students/:id', (req: AuthenticatedRequest, res) => {
-  const st = db.prepare(`SELECT user_id, nim FROM students WHERE id = ?`).get(req.params.id) as
-    | { user_id: string; nim: string }
+  const st = db.prepare(`SELECT id, user_id, nim, full_name FROM students WHERE id = ?`).get(req.params.id) as
+    | { id: string; user_id: string; nim: string; full_name: string }
     | undefined;
   if (!st) {
     res.status(404).json({ error: 'Mahasiswa tidak ditemukan.' });
     return;
   }
+  cleanupStudentUploadedFiles([st.id]);
   withTransaction(() => {
+    db.prepare(`DELETE FROM user_sessions WHERE user_id = ?`).run(st.user_id);
     db.prepare(`DELETE FROM user_profiles WHERE id = ?`).run(st.user_id);
-    logAdminActivity(req.authUser!.id, 'DELETE_STUDENT', 'students', req.params.id, { nim: st.nim });
+    logAdminActivity(req.authUser!.id, 'DELETE_STUDENT', 'students', st.id, {
+      nim: st.nim,
+      fullName: st.full_name,
+    });
   });
   res.json({ ok: true });
+});
+
+adminRouter.post('/students/bulk-delete', (req: AuthenticatedRequest, res) => {
+  const { studentIds } = req.body as { studentIds?: unknown };
+  if (!Array.isArray(studentIds) || studentIds.length === 0) {
+    res.status(400).json({ error: 'Pilih minimal satu mahasiswa untuk dihapus.' });
+    return;
+  }
+  const cleanIds = Array.from(new Set(studentIds.map((id) => String(id ?? '').trim()).filter(Boolean)));
+  if (cleanIds.length === 0) {
+    res.status(400).json({ error: 'Daftar ID mahasiswa tidak valid.' });
+    return;
+  }
+  const placeholders = cleanIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(`SELECT id, user_id, nim FROM students WHERE id IN (${placeholders})`)
+    .all(...cleanIds) as { id: string; user_id: string; nim: string }[];
+
+  if (rows.length === 0) {
+    res.status(404).json({ error: 'Data mahasiswa tidak ditemukan.' });
+    return;
+  }
+
+  cleanupStudentUploadedFiles(rows.map((r) => r.id));
+  const userIds = rows.map((r) => r.user_id);
+  const userPlaceholders = userIds.map(() => '?').join(',');
+
+  withTransaction(() => {
+    db.prepare(`DELETE FROM user_sessions WHERE user_id IN (${userPlaceholders})`).run(...userIds);
+    db.prepare(`DELETE FROM user_profiles WHERE id IN (${userPlaceholders})`).run(...userIds);
+    logAdminActivity(req.authUser!.id, 'BULK_DELETE_STUDENTS', 'students', '', {
+      deletedCount: rows.length,
+      nims: rows.slice(0, 20).map((r) => r.nim),
+    });
+  });
+
+  res.json({ deleted: rows.length });
 });
 
 adminRouter.post('/students/import-excel/preview', memoryUpload.single('file'), async (req, res) => {
@@ -716,6 +785,7 @@ adminRouter.post('/students/import-excel/commit', (req: AuthenticatedRequest, re
       badge: StudentBadge;
       skipBlack: boolean;
       isDuplicateInFile: boolean;
+      existsInDb?: boolean;
       validationError: string | null;
       historicalWeeks: Partial<Record<number, AttendanceStatus>>;
     }>;
@@ -727,10 +797,21 @@ adminRouter.post('/students/import-excel/commit', (req: AuthenticatedRequest, re
     return;
   }
 
-  const validInputSheets = new Set(
-    rows.filter((r) => !r.skipBlack && !r.validationError && !r.isDuplicateInFile).map((r) => r.sheetName)
+  const existingNimSet = new Set(
+    (db.prepare(`SELECT upper(nim) AS nim FROM students`).all() as { nim: string }[]).map((r) => r.nim)
   );
-  const unmappedSheets = Array.from(validInputSheets).filter((s) => !sheetClassMap[s]);
+  const sheetsNeedingClass = new Set(
+    rows
+      .filter(
+        (r) =>
+          !r.skipBlack &&
+          !r.validationError &&
+          !r.isDuplicateInFile &&
+          !existingNimSet.has(String(r.nim ?? '').trim().toUpperCase())
+      )
+      .map((r) => r.sheetName)
+  );
+  const unmappedSheets = Array.from(sheetsNeedingClass).filter((s) => !sheetClassMap[s]);
   if (unmappedSheets.length > 0) {
     res.status(400).json({
       error: `Pilih kelas tujuan atau buat kelas otomatis terlebih dahulu untuk sheet: ${unmappedSheets.join(', ')}`,
@@ -751,15 +832,17 @@ adminRouter.post('/students/import-excel/commit', (req: AuthenticatedRequest, re
     .get() as { active_academic_year: string } | undefined;
 
   let created = 0;
-  let updated = 0;
+  let updatedWithNewWeeks = 0;
+  let historicalAdded = 0;
+  let skippedExisting = 0;
   let skipped = 0;
   let autoCreatedClasses = 0;
 
   try {
     withTransaction(() => {
-      // Resolve or auto-create classes mapped as __AUTO__:<prodiId>
+      // Resolve or auto-create classes mapped as __AUTO__:<prodiId> for sheets with new students
       const resolvedClassMap = new Map<string, { classId: string; prodiId: string }>();
-      for (const sheetName of validInputSheets) {
+      for (const sheetName of sheetsNeedingClass) {
         const mappedVal = sheetClassMap[sheetName] ?? '';
         if (mappedVal.startsWith('__AUTO__:')) {
           const prodiId = mappedVal.slice('__AUTO__:'.length).trim();
@@ -796,35 +879,34 @@ adminRouter.post('/students/import-excel/commit', (req: AuthenticatedRequest, re
         }
       }
 
+      const insertHistIgnoreStmt = db.prepare(
+        `INSERT OR IGNORE INTO historical_attendance (id, student_id, week_number, status, imported_by_admin_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+
       for (const r of rows) {
         if (r.skipBlack || r.validationError || r.isDuplicateInFile) {
           skipped += 1;
           continue;
         }
-        const target = resolvedClassMap.get(r.sheetName);
-        if (!target) {
-          skipped += 1;
-          continue;
-        }
-        const { classId, prodiId } = target;
 
-        let studentId: string;
-        const existing = db.prepare(`SELECT id, user_id FROM students WHERE upper(nim) = upper(?)`).get(r.nim) as
-          | { id: string; user_id: string }
+        const existing = db.prepare(`SELECT id FROM students WHERE upper(nim) = upper(?)`).get(r.nim) as
+          | { id: string }
           | undefined;
 
+        let studentId: string;
+        const isNewStudent = !existing;
+
         if (existing) {
+          // Existing student: DO NOT overwrite student/account data or existing weeks!
           studentId = existing.id;
-          db.prepare(`UPDATE user_profiles SET full_name = ?, updated_at = ? WHERE id = ?`).run(
-            r.fullName,
-            new Date().toISOString(),
-            existing.user_id
-          );
-          db.prepare(
-            `UPDATE students SET full_name = ?, study_program_id = ?, class_id = ?, cohort_year = ?, semester = ?, badge = ?, updated_at = ? WHERE id = ?`
-          ).run(r.fullName, prodiId, classId, r.cohortYear, r.semester, r.badge, new Date().toISOString(), studentId);
-          updated += 1;
         } else {
+          const target = resolvedClassMap.get(r.sheetName);
+          if (!target) {
+            skipped += 1;
+            continue;
+          }
+          const { classId, prodiId } = target;
           const userId = newId();
           studentId = newId();
           const baseUsername = r.username.toLowerCase().replace(/[^a-z0-9._-]/g, '') || r.nim.toLowerCase();
@@ -854,33 +936,68 @@ adminRouter.post('/students/import-excel/commit', (req: AuthenticatedRequest, re
           created += 1;
         }
 
+        let newWeeksForStudent = 0;
         if (importHistorical && r.historicalWeeks) {
-          for (let w = 1; w <= 8; w++) {
-            const st = r.historicalWeeks[w];
-            if (st) {
-              db.prepare(
-                `INSERT INTO historical_attendance (id, student_id, week_number, status, imported_by_admin_id, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(student_id, week_number) DO UPDATE SET
-                   status = excluded.status,
-                   imported_by_admin_id = excluded.imported_by_admin_id,
-                   updated_at = excluded.updated_at`
-              ).run(newId(), studentId, w, st, req.authUser!.id, new Date().toISOString());
+          const weekEntries = Object.entries(r.historicalWeeks)
+            .map(([k, val]) => ({ weekNumber: Number(k), status: val }))
+            .filter(
+              (entry): entry is { weekNumber: number; status: AttendanceStatus } =>
+                Number.isInteger(entry.weekNumber) &&
+                entry.weekNumber >= 1 &&
+                typeof entry.status === 'string' &&
+                ['Hadir', 'Izin', 'Sakit', 'Alfa'].includes(entry.status)
+            )
+            .sort((a, b) => a.weekNumber - b.weekNumber);
+
+          const nowIso = new Date().toISOString();
+          for (const entry of weekEntries) {
+            const info = insertHistIgnoreStmt.run(
+              newId(),
+              studentId,
+              entry.weekNumber,
+              entry.status,
+              req.authUser!.id,
+              nowIso
+            );
+            if (Number(info.changes) > 0) {
+              newWeeksForStudent += 1;
+              historicalAdded += 1;
             }
           }
-          recalculateStudentAttendanceAndQuotas(studentId, req.authUser!.id);
+
+          if (newWeeksForStudent > 0) {
+            recalculateStudentAttendanceAndQuotas(studentId, req.authUser!.id);
+          }
+        }
+
+        if (!isNewStudent) {
+          if (newWeeksForStudent > 0) {
+            updatedWithNewWeeks += 1;
+          } else {
+            skippedExisting += 1;
+          }
         }
       }
 
       logAdminActivity(req.authUser!.id, 'IMPORT_EXCEL_STUDENTS', 'students', '', {
         created,
-        updated,
+        updatedWithNewWeeks,
+        historicalAdded,
+        skippedExisting,
         skipped,
         autoCreatedClasses,
       });
     });
 
-    res.json({ created, updated, skipped, autoCreatedClasses });
+    res.json({
+      created,
+      updated: updatedWithNewWeeks,
+      updatedWithNewWeeks,
+      historicalAdded,
+      skippedExisting,
+      skipped,
+      autoCreatedClasses,
+    });
   } catch (err) {
     res.status(400).json({
       error: err instanceof Error ? err.message : 'Gagal menyimpan data import Excel.',
@@ -1225,7 +1342,7 @@ adminRouter.put('/attendance/historical', (req: AuthenticatedRequest, res) => {
   const touchedStudents = new Set<string>();
   withTransaction(() => {
     for (const u of updates) {
-      if (u.weekNumber < 1 || u.weekNumber > 8) continue;
+      if (!Number.isInteger(u.weekNumber) || u.weekNumber < 1) continue;
       if (!['Hadir', 'Izin', 'Sakit', 'Alfa'].includes(u.status)) continue;
       db.prepare(
         `INSERT INTO historical_attendance (id, student_id, week_number, status, imported_by_admin_id, updated_at)

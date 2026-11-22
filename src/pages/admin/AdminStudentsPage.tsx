@@ -37,10 +37,14 @@ interface ExcelPreviewData {
     suggestedProdiId: string | null;
     totalRows: number;
     validRows: number;
+    newStudentRows: number;
+    existingWithNewWeeksRows: number;
+    skippedExistingRows: number;
     afkRows: number;
     skippedBlackRows: number;
     duplicateRows: number;
     invalidRows: number;
+    detectedWeeks: number[];
   }>;
   rows: Array<{
     sheetName: string;
@@ -55,9 +59,13 @@ interface ExcelPreviewData {
     skipBlack: boolean;
     isDuplicateInFile: boolean;
     existsInDb: boolean;
+    newWeeksCount: number;
+    existingWeeksCount: number;
+    willSkipExisting: boolean;
     validationError: string | null;
     historicalWeeks: Record<number, string>;
   }>;
+  detectedWeeks?: number[];
   ignoredSheets?: Array<{ sheetName: string; reason: string }>;
 }
 
@@ -96,11 +104,18 @@ export const AdminStudentsPage: React.FC = () => {
   const [fSemester, setFSemester] = useState(1);
   const [fBadge, setFBadge] = useState<StudentBadge>('Netral');
 
-  // Account Management Modal
+  // Account Management & Delete Modals
   const [accountModal, setAccountModal] = useState<StudentRecord | null>(null);
   const [accUsername, setAccUsername] = useState('');
   const [accNewPass, setAccNewPass] = useState('');
   const [accActive, setAccActive] = useState(true);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [deleteConfirm, setDeleteConfirm] = useState<
+    | { mode: 'single'; student: StudentRecord }
+    | { mode: 'bulk'; ids: string[] }
+    | null
+  >(null);
+  const [deleting, setDeleting] = useState(false);
 
   // Excel Import Modal
   const [excelModalOpen, setExcelModalOpen] = useState(false);
@@ -173,6 +188,7 @@ export const AdminStudentsPage: React.FC = () => {
         }))
       );
       setTotal(res.total);
+      setSelectedIds([]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat data mahasiswa');
     } finally {
@@ -247,13 +263,29 @@ export const AdminStudentsPage: React.FC = () => {
     }
   };
 
-  const handleDeleteStudent = async (st: StudentRecord) => {
+  const confirmDeleteAction = async () => {
+    if (!deleteConfirm) return;
+    setDeleting(true);
     try {
-      await apiRequest(`/api/admin/students/${st.id}`, { method: 'DELETE' });
-      pushToast({ type: 'success', title: `Akun ${st.fullName} dihapus` });
+      if (deleteConfirm.mode === 'single') {
+        const st = deleteConfirm.student;
+        await apiRequest(`/api/admin/students/${st.id}`, { method: 'DELETE' });
+        pushToast({ type: 'success', title: `Data & akun ${st.fullName} dihapus` });
+        if (accountModal?.id === st.id) setAccountModal(null);
+      } else {
+        const res = await apiRequest<{ deleted: number }>('/api/admin/students/bulk-delete', {
+          method: 'POST',
+          body: JSON.stringify({ studentIds: deleteConfirm.ids }),
+        });
+        pushToast({ type: 'success', title: `${res.deleted} data & akun mahasiswa dihapus` });
+        setSelectedIds([]);
+      }
+      setDeleteConfirm(null);
       await loadStudents();
     } catch (err) {
       pushToast({ type: 'error', title: 'Gagal menghapus', description: err instanceof Error ? err.message : '' });
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -331,9 +363,14 @@ export const AdminStudentsPage: React.FC = () => {
   const handleExcelCommit = async () => {
     if (!excelPreview) return;
     setExcelError(null);
-    const unmapped = excelPreview.sheets.filter((sh) => !sheetClassMap[sh.sheetName]);
+    const sheetsNeedingClass = new Set(
+      excelPreview.rows
+        .filter((r) => !r.skipBlack && !r.validationError && !r.isDuplicateInFile && !r.existsInDb)
+        .map((r) => r.sheetName)
+    );
+    const unmapped = Array.from(sheetsNeedingClass).filter((name) => !sheetClassMap[name]);
     if (unmapped.length > 0) {
-      const msg = `Pilih kelas tujuan atau opsi buat kelas otomatis untuk sheet: ${unmapped.map((s) => s.sheetName).join(', ')}`;
+      const msg = `Pilih kelas tujuan atau opsi buat kelas otomatis untuk sheet: ${unmapped.join(', ')}`;
       setExcelError(msg);
       pushToast({ type: 'error', title: 'Pemetaan kelas belum lengkap', description: msg });
       return;
@@ -343,25 +380,35 @@ export const AdminStudentsPage: React.FC = () => {
     setImportProgress(25);
     abortRef.current = new AbortController();
     try {
-      const res = await apiRequest<{ created: number; updated: number; skipped: number; autoCreatedClasses?: number }>(
-        '/api/admin/students/import-excel/commit',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            sheetClassMap,
-            rows: excelPreview.rows,
-            importHistorical,
-          }),
-          signal: abortRef.current.signal,
-        }
-      );
+      const res = await apiRequest<{
+        created: number;
+        updated: number;
+        updatedWithNewWeeks?: number;
+        historicalAdded?: number;
+        skippedExisting?: number;
+        skipped: number;
+        autoCreatedClasses?: number;
+      }>('/api/admin/students/import-excel/commit', {
+        method: 'POST',
+        body: JSON.stringify({
+          sheetClassMap,
+          rows: excelPreview.rows,
+          importHistorical,
+        }),
+        signal: abortRef.current.signal,
+      });
       setImportProgress(100);
+      const parts = [
+        `${res.created} mahasiswa baru`,
+        `${res.historicalAdded ?? 0} absensi minggu baru`,
+        `${res.skippedExisting ?? 0} data sudah ada (dilewati)`,
+      ];
+      if (res.skipped > 0) parts.push(`${res.skipped} baris dilewati`);
+      if (res.autoCreatedClasses) parts.push(`${res.autoCreatedClasses} kelas baru dibuat`);
       pushToast({
         type: 'success',
         title: 'Import Excel Selesai',
-        description: `${res.created} dibuat, ${res.updated} diperbarui, ${res.skipped} dilewati${
-          res.autoCreatedClasses ? ` (${res.autoCreatedClasses} kelas baru dibuat otomatis)` : ''
-        }.`,
+        description: parts.join(', ') + '.',
       });
       setExcelModalOpen(false);
       setExcelPreview(null);
@@ -412,6 +459,16 @@ export const AdminStudentsPage: React.FC = () => {
             <Upload className="w-3.5 h-3.5 text-[#B5D45D]" />
             Import Excel (.xlsx)
           </button>
+          {selectedIds.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setDeleteConfirm({ mode: 'bulk', ids: selectedIds })}
+              className="inline-flex items-center gap-1.5 rounded-full bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-semibold transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Hapus Terpilih ({selectedIds.length})
+            </button>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -528,6 +585,21 @@ export const AdminStudentsPage: React.FC = () => {
           <table className="w-full text-sm text-left">
             <thead className="bg-[#F0F8DF] border-b border-[#D5E4B6] text-xs font-semibold text-[#364B0F]">
               <tr>
+                <th className="pl-4 pr-2 py-3 w-8">
+                  <input
+                    type="checkbox"
+                    aria-label="Pilih semua mahasiswa di halaman ini"
+                    checked={items.length > 0 && items.every((st) => selectedIds.includes(st.id))}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setSelectedIds(items.map((st) => st.id));
+                      } else {
+                        setSelectedIds([]);
+                      }
+                    }}
+                    className="w-4 h-4 accent-[#536F1A]"
+                  />
+                </th>
                 <th className="px-4 py-3">NIM</th>
                 <th className="px-4 py-3">Nama & Username</th>
                 <th className="px-4 py-3">Prodi / Kelas</th>
@@ -539,6 +611,21 @@ export const AdminStudentsPage: React.FC = () => {
             <tbody className="divide-y divide-[#EBF3DA]">
               {items.map((st) => (
                 <tr key={st.id} className="hover:bg-[#F0F8DF]/40">
+                  <td className="pl-4 pr-2 py-3">
+                    <input
+                      type="checkbox"
+                      aria-label={`Pilih ${st.fullName}`}
+                      checked={selectedIds.includes(st.id)}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedIds((prev) => (prev.includes(st.id) ? prev : [...prev, st.id]));
+                        } else {
+                          setSelectedIds((prev) => prev.filter((id) => id !== st.id));
+                        }
+                      }}
+                      className="w-4 h-4 accent-[#536F1A]"
+                    />
+                  </td>
                   <td className="px-4 py-3 font-mono tabular-nums text-xs font-semibold">{st.nim}</td>
                   <td className="px-4 py-3">
                     <p className="font-semibold text-[#20251D]">{st.fullName}</p>
@@ -577,8 +664,8 @@ export const AdminStudentsPage: React.FC = () => {
                       </button>
                       <button
                         type="button"
-                        onClick={() => void handleDeleteStudent(st)}
-                        title="Hapus Mahasiswa"
+                        onClick={() => setDeleteConfirm({ mode: 'single', student: st })}
+                        title="Hapus Data & Akun Mahasiswa"
                         className="p-2 rounded-full hover:bg-red-50 text-red-600"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -817,37 +904,103 @@ export const AdminStudentsPage: React.FC = () => {
             />
             Akun Aktif (dapat login ke Portal Mahasiswa)
           </label>
-          <div className="flex justify-end gap-2 pt-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+            {accountModal ? (
+              <button
+                type="button"
+                onClick={() => setDeleteConfirm({ mode: 'single', student: accountModal })}
+                className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 px-4 py-2 text-xs font-semibold"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Hapus Akun & Data
+              </button>
+            ) : (
+              <span />
+            )}
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setAccountModal(null)}
+                className="rounded-full border border-[#D5E4B6] px-5 py-2 text-xs font-semibold"
+              >
+                Batal
+              </button>
+              <button
+                type="submit"
+                className="rounded-full bg-[#171A17] text-[#B5D45D] px-5 py-2 text-xs font-bold"
+              >
+                Simpan Perubahan Akun
+              </button>
+            </div>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Modal Konfirmasi Hapus Data & Akun Mahasiswa */}
+      <Modal
+        open={Boolean(deleteConfirm)}
+        onClose={() => !deleting && setDeleteConfirm(null)}
+        title={
+          deleteConfirm?.mode === 'bulk'
+            ? `Hapus ${deleteConfirm.ids.length} Mahasiswa Terpilih?`
+            : 'Hapus Data & Akun Mahasiswa?'
+        }
+        subtitle="Tindakan ini menghapus data mahasiswa sekaligus akun login secara permanen"
+      >
+        <div className="space-y-4">
+          <div className="rounded-xl bg-red-50 border border-red-200 p-3.5 text-xs text-red-900 space-y-1">
+            {deleteConfirm?.mode === 'single' ? (
+              <p>
+                Anda akan menghapus <strong>{deleteConfirm.student.fullName}</strong> (NIM{' '}
+                <span className="font-mono">{deleteConfirm.student.nim}</span> · akun{' '}
+                <span className="font-mono">@{deleteConfirm.student.username}</span>).
+              </p>
+            ) : (
+              <p>
+                Anda akan menghapus <strong>{deleteConfirm?.ids.length ?? 0} data & akun mahasiswa</strong> yang
+                dipilih.
+              </p>
+            )}
+            <p>
+              Seluruh riwayat absensi, pengumpulan tugas, nilai, XP, streak, dan notifikasi milik mahasiswa tersebut
+              juga ikut terhapus.
+            </p>
+          </div>
+          <div className="flex justify-end gap-2">
             <button
               type="button"
-              onClick={() => setAccountModal(null)}
+              disabled={deleting}
+              onClick={() => setDeleteConfirm(null)}
               className="rounded-full border border-[#D5E4B6] px-5 py-2 text-xs font-semibold"
             >
               Batal
             </button>
             <button
-              type="submit"
-              className="rounded-full bg-[#171A17] text-[#B5D45D] px-5 py-2 text-xs font-bold"
+              type="button"
+              disabled={deleting}
+              onClick={() => void confirmDeleteAction()}
+              className="rounded-full bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white px-5 py-2 text-xs font-bold"
             >
-              Simpan Perubahan Akun
+              {deleting ? 'Menghapus...' : 'Ya, Hapus Permanen'}
             </button>
           </div>
-        </form>
+        </div>
       </Modal>
 
       {/* Modal Import Excel Multi-Sheet */}
       <Modal
         open={excelModalOpen}
         onClose={() => !importing && setExcelModalOpen(false)}
-        title="Import Mahasiswa dari Excel (.xlsx)"
-        subtitle="Mendukung multi-sheet, warna merah = AFK, blok hitam = dilewati, dan histori Minggu 1–8"
+        title="Import Mahasiswa & Absensi dari Excel (.xlsx)"
+        subtitle="Tanpa batas jumlah minggu · Data yang sudah ada otomatis dilewati (hanya input data baru)"
         maxWidthClass="max-w-3xl"
       >
         <div className="space-y-4">
           <div className="rounded-2xl border border-dashed border-[#536F1A] bg-[#F0F8DF]/50 p-5 text-center space-y-3">
             <p className="text-xs text-[#20251D]">
-              Pilih workbook <strong>.xlsx</strong> atau <strong>.csv</strong> dengan kolom <strong>NIM/NPM</strong> dan{' '}
-              <strong>Nama</strong>. Jika kelas belum dibuat, Anda dapat membuat kelas otomatis langsung dari nama sheet.
+              Pilih workbook <strong>.xlsx</strong> atau <strong>.csv</strong> dengan kolom <strong>NIM/NPM</strong>,{' '}
+              <strong>Nama</strong>, dan kolom minggu berapapun (contoh: <strong>Minggu 1, Minggu 9, M12</strong>).
+              Saat import ulang di minggu berikutnya, data mahasiswa & minggu yang sudah tersimpan tidak akan ditimpa.
             </p>
             <label className="inline-flex items-center gap-2 rounded-full bg-[#B5D45D] hover:bg-[#C5E370] text-[#171A17] px-5 py-2.5 text-xs font-bold cursor-pointer">
               <Upload className="w-4 h-4" />
@@ -891,6 +1044,15 @@ export const AdminStudentsPage: React.FC = () => {
                 </div>
               )}
 
+              {excelPreview.detectedWeeks && excelPreview.detectedWeeks.length > 0 && (
+                <div className="rounded-xl bg-[#F0F8DF] border border-[#D5E4B6] px-3.5 py-2 text-xs text-[#364B0F]">
+                  Kolom absensi terdeteksi:{' '}
+                  <span className="font-mono font-semibold">
+                    {excelPreview.detectedWeeks.map((w) => `M${w}`).join(', ')}
+                  </span>
+                </div>
+              )}
+
               <div className="space-y-2">
                 <h4 className="text-xs font-bold text-[#20251D]">Pemetaan Sheet ke Kelas Tujuan</h4>
                 {excelPreview.sheets.map((sh) => (
@@ -901,8 +1063,9 @@ export const AdminStudentsPage: React.FC = () => {
                     <div>
                       <p className="font-bold text-[#20251D]">{sh.sheetName}</p>
                       <p className="text-[#536F1A] tabular-nums">
-                        Valid: {sh.validRows} · AFK (Merah): {sh.afkRows} · Dilewati (Hitam): {sh.skippedBlackRows} ·
-                        Duplikat: {sh.duplicateRows} · Error: {sh.invalidRows}
+                        Mahasiswa Baru: {sh.newStudentRows} · Tambah Minggu Baru: {sh.existingWithNewWeeksRows} · Sudah
+                        Ada (Dilewati): {sh.skippedExistingRows} · AFK: {sh.afkRows} · Blok Hitam: {sh.skippedBlackRows}{' '}
+                        · Duplikat/Error: {sh.duplicateRows + sh.invalidRows}
                       </p>
                     </div>
                     <select
@@ -943,7 +1106,7 @@ export const AdminStudentsPage: React.FC = () => {
                   onChange={(e) => setImportHistorical(e.target.checked)}
                   className="w-4 h-4 accent-[#536F1A]"
                 />
-                Import histori absensi Minggu 1–8 sekaligus kalkulasi XP historis
+                Import seluruh absensi mingguan yang belum ada sekaligus kalkulasi XP (minggu lama tidak ditimpa)
               </label>
 
               <div className="max-h-56 overflow-y-auto rounded-xl border border-[#D5E4B6]">
@@ -958,7 +1121,16 @@ export const AdminStudentsPage: React.FC = () => {
                   </thead>
                   <tbody className="divide-y divide-[#EBF3DA]">
                     {excelPreview.rows.slice(0, 60).map((r, idx) => (
-                      <tr key={idx} className={r.skipBlack ? 'bg-neutral-900 text-white' : ''}>
+                      <tr
+                        key={idx}
+                        className={
+                          r.skipBlack
+                            ? 'bg-neutral-900 text-white'
+                            : r.willSkipExisting
+                              ? 'bg-neutral-50 text-neutral-500'
+                              : ''
+                        }
+                      >
                         <td className="px-3 py-1.5">{r.sheetName}</td>
                         <td className="px-3 py-1.5 font-mono">{r.nim}</td>
                         <td className="px-3 py-1.5">{r.fullName}</td>
@@ -969,11 +1141,13 @@ export const AdminStudentsPage: React.FC = () => {
                               ? r.validationError
                               : r.isDuplicateInFile
                                 ? 'Duplikat di File'
-                                : r.badge === 'AFK'
-                                  ? 'Merah (AFK)'
+                                : r.willSkipExisting
+                                  ? 'Sudah Ada (Dilewati)'
                                   : r.existsInDb
-                                    ? 'Update Data'
-                                    : 'Siap Import'}
+                                    ? `Tambah ${r.newWeeksCount} Minggu Baru (${r.existingWeeksCount} lama dilewati)`
+                                    : r.badge === 'AFK'
+                                      ? 'Mahasiswa Baru · Merah (AFK)'
+                                      : 'Mahasiswa Baru'}
                         </td>
                       </tr>
                     ))}
@@ -995,7 +1169,13 @@ export const AdminStudentsPage: React.FC = () => {
                   onClick={() => void handleExcelCommit()}
                   className="rounded-full bg-[#B5D45D] hover:bg-[#C5E370] text-[#171A17] px-6 py-2 text-xs font-bold"
                 >
-                  Konfirmasi & Import ({excelPreview.rows.filter((r) => !r.skipBlack && !r.validationError && !r.isDuplicateInFile).length} baris)
+                  Konfirmasi & Import (
+                  {
+                    excelPreview.rows.filter(
+                      (r) => !r.skipBlack && !r.validationError && !r.isDuplicateInFile && !r.willSkipExisting
+                    ).length
+                  }{' '}
+                  baris baru)
                 </button>
               </div>
             </div>
