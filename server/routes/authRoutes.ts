@@ -10,6 +10,7 @@ import {
   requireAuth,
   revokeSession,
   setSessionCookie,
+  syncEnvBootstrapAdminIfNeeded,
   verifyPassword,
   type AuthenticatedRequest,
 } from '../auth.ts';
@@ -80,7 +81,7 @@ authRouter.post('/admin/bootstrap', (req, res) => {
     });
 
     const { token, expiresAtUtc } = createSession(adminId, 'ADMIN');
-    setSessionCookie(res, token, expiresAtUtc);
+    setSessionCookie(res, token, expiresAtUtc, req);
     const user = getUserById(adminId);
     res.status(201).json({ token, expiresAtUtc, user });
   } catch (err) {
@@ -94,12 +95,18 @@ authRouter.post('/admin/bootstrap', (req, res) => {
 
 authRouter.post('/admin/login', (req, res) => {
   const { identifier, password } = req.body as { identifier?: string; password?: string };
-  const cleanId = (identifier ?? '').trim().toLowerCase();
-  const rawPass = password ?? '';
+  const cleanId = String(identifier ?? '').trim().toLowerCase();
+  const rawPass = String(password ?? '');
+  const trimmedPass = rawPass.trim();
 
-  if (!cleanId || !rawPass) {
+  if (!cleanId || !trimmedPass) {
     res.status(400).json({ error: 'Username/email dan password wajib diisi.' });
     return;
+  }
+
+  // Ensure env-configured admin credentials are synced if set
+  if (process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()) {
+    syncEnvBootstrapAdminIfNeeded();
   }
 
   const row = db
@@ -113,8 +120,30 @@ authRouter.post('/admin/login', (req, res) => {
     | { id: string; password_hash: string; role: string; is_active: number }
     | undefined;
 
-  if (!row || row.role !== 'ADMIN' || !verifyPassword(rawPass, row.password_hash)) {
-    res.status(401).json({ error: 'Kredensial Admin tidak valid.' });
+  const isNonProd = process.env.NODE_ENV !== 'production';
+
+  if (!row) {
+    if (isNonProd) {
+      const msg = hasAnyAdmin()
+        ? 'Kredensial Admin tidak valid (username/email Admin tidak ditemukan).'
+        : 'Akun Admin belum dibuat atau belum dikonfigurasi di server.';
+      res.status(401).json({ error: msg });
+    } else {
+      res.status(401).json({ error: 'Kredensial Admin tidak valid.' });
+    }
+    return;
+  }
+
+  const passwordValid =
+    verifyPassword(rawPass, row.password_hash) ||
+    (trimmedPass !== rawPass && verifyPassword(trimmedPass, row.password_hash));
+
+  if (!passwordValid) {
+    res.status(401).json({
+      error: isNonProd
+        ? 'Kredensial Admin tidak valid (password tidak sesuai).'
+        : 'Kredensial Admin tidak valid.',
+    });
     return;
   }
 
@@ -125,17 +154,18 @@ authRouter.post('/admin/login', (req, res) => {
 
   db.prepare(`UPDATE user_profiles SET last_login_at = ? WHERE id = ?`).run(new Date().toISOString(), row.id);
   const { token, expiresAtUtc } = createSession(row.id, 'ADMIN');
-  setSessionCookie(res, token, expiresAtUtc);
+  setSessionCookie(res, token, expiresAtUtc, req);
   const user = getUserById(row.id);
   res.json({ token, expiresAtUtc, user });
 });
 
 authRouter.post('/student/login', (req, res) => {
   const { username, password } = req.body as { username?: string; password?: string };
-  const cleanUsername = (username ?? '').trim().toLowerCase();
-  const rawPass = password ?? '';
+  const cleanUsername = String(username ?? '').trim().toLowerCase();
+  const rawPass = String(password ?? '');
+  const trimmedPass = rawPass.trim();
 
-  if (!cleanUsername || !rawPass) {
+  if (!cleanUsername || !trimmedPass) {
     res.status(400).json({ error: 'Username dan password wajib diisi.' });
     return;
   }
@@ -152,7 +182,12 @@ authRouter.post('/student/login', (req, res) => {
     | { id: string; password_hash: string; role: string; is_active: number; student_id: string | null }
     | undefined;
 
-  if (!row || row.role !== 'MAHASISWA' || !row.student_id || !verifyPassword(rawPass, row.password_hash)) {
+  const passwordValid =
+    row &&
+    (verifyPassword(rawPass, row.password_hash) ||
+      (trimmedPass !== rawPass && verifyPassword(trimmedPass, row.password_hash)));
+
+  if (!row || row.role !== 'MAHASISWA' || !row.student_id || !passwordValid) {
     res.status(401).json({ error: 'Username atau password mahasiswa salah.' });
     return;
   }
@@ -168,7 +203,7 @@ authRouter.post('/student/login', (req, res) => {
   });
 
   const { token, expiresAtUtc } = createSession(row.id, 'MAHASISWA');
-  setSessionCookie(res, token, expiresAtUtc);
+  setSessionCookie(res, token, expiresAtUtc, req);
   const user = getUserById(row.id);
   res.json({ token, expiresAtUtc, user, loginReward });
 });
@@ -182,6 +217,6 @@ authRouter.post('/logout', (req, res) => {
   if (token) {
     revokeSession(token);
   }
-  clearSessionCookie(res);
+  clearSessionCookie(res, req);
   res.json({ ok: true });
 });

@@ -55,24 +55,39 @@ export function revokeSession(rawToken: string): void {
   );
 }
 
-export function setSessionCookie(res: Response, token: string, expiresAtUtc: string): void {
+function isHttpsRequest(req?: Request): boolean {
+  if (!req) return true;
+  if (req.secure) return true;
+  const proto = String(req.headers['x-forwarded-proto'] ?? '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (proto === 'https') return true;
+  const origin = String(req.headers.origin ?? req.headers.referer ?? '');
+  if (origin.startsWith('https://')) return true;
+  return false;
+}
+
+export function setSessionCookie(res: Response, token: string, expiresAtUtc: string, req?: Request): void {
   const expires = new Date(expiresAtUtc);
+  const https = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    partitioned: true,
+    secure: https,
+    sameSite: https ? 'none' : 'lax',
+    ...(https ? { partitioned: true } : {}),
     expires,
     path: '/',
   });
 }
 
-export function clearSessionCookie(res: Response): void {
+export function clearSessionCookie(res: Response, req?: Request): void {
+  const https = isHttpsRequest(req);
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    partitioned: true,
+    secure: https,
+    sameSite: https ? 'none' : 'lax',
+    ...(https ? { partitioned: true } : {}),
     path: '/',
   });
 }
@@ -225,27 +240,53 @@ export function syncEnvBootstrapAdminIfNeeded(): void {
   const envEmail = process.env.ADMIN_BOOTSTRAP_EMAIL?.trim().toLowerCase() || null;
   if (!envPass) return;
 
-  const existing = db
-    .prepare(`SELECT id, username, email, password_hash FROM user_profiles WHERE role = 'ADMIN' LIMIT 1`)
-    .get() as
-    | { id: string; username: string; email: string | null; password_hash: string }
+  // Prefer matching an existing ADMIN account by env username/email; fall back to the oldest ADMIN account
+  const matchedByIdentity = db
+    .prepare(
+      `SELECT id, username, email, password_hash, is_active
+       FROM user_profiles
+       WHERE role = 'ADMIN' AND (lower(username) = ? OR (? IS NOT NULL AND lower(email) = ?))
+       LIMIT 1`
+    )
+    .get(envUser, envEmail, envEmail) as
+    | { id: string; username: string; email: string | null; password_hash: string; is_active: number }
     | undefined;
 
+  const existing =
+    matchedByIdentity ??
+    (db
+      .prepare(
+        `SELECT id, username, email, password_hash, is_active
+         FROM user_profiles
+         WHERE role = 'ADMIN'
+         ORDER BY created_at ASC
+         LIMIT 1`
+      )
+      .get() as
+      | { id: string; username: string; email: string | null; password_hash: string; is_active: number }
+      | undefined);
+
   if (existing) {
-    const nextEmail = envEmail ?? existing.email ?? null;
+    const nextEmail = envEmail ?? existing.email?.toLowerCase() ?? null;
     const sameUser = existing.username.toLowerCase() === envUser;
     const sameEmail = (existing.email?.toLowerCase() ?? null) === nextEmail;
     const samePass = verifyPassword(envPass, existing.password_hash);
-    if (sameUser && sameEmail && samePass) return;
+    const sameActive = Number(existing.is_active) === 1;
+    if (sameUser && sameEmail && samePass && sameActive) return;
 
     const hash = samePass ? existing.password_hash : hashPassword(envPass);
-    db.prepare(`UPDATE user_profiles SET username = ?, email = ?, password_hash = ?, updated_at = ? WHERE id = ?`).run(
-      envUser,
-      nextEmail,
-      hash,
-      new Date().toISOString(),
-      existing.id
-    );
+    try {
+      db.prepare(
+        `UPDATE user_profiles
+         SET username = ?, email = ?, password_hash = ?, is_active = 1, updated_at = ?
+         WHERE id = ?`
+      ).run(envUser, nextEmail, hash, new Date().toISOString(), existing.id);
+    } catch {
+      // Fallback: if username/email conflicts with another row, update password & active flag safely
+      db.prepare(
+        `UPDATE user_profiles SET password_hash = ?, is_active = 1, updated_at = ? WHERE id = ?`
+      ).run(hash, new Date().toISOString(), existing.id);
+    }
   } else {
     db.prepare(
       `INSERT INTO user_profiles (id, username, email, password_hash, full_name, role, is_active)
