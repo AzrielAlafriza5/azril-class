@@ -3,14 +3,9 @@ import type { NextFunction, Request, Response } from 'express';
 import { db, newId } from './db/database.ts';
 import type { AuthUser, UserRole } from '../shared/types.ts';
 
-const EPHEMERAL_SECRET = crypto.randomBytes(32).toString('hex');
-function getSessionSecret(): string {
-  return process.env.SESSION_SECRET?.trim() || EPHEMERAL_SECRET;
-}
-
 export const SESSION_COOKIE_NAME = 'azril_clas_session';
-// Max 8 hours session as specified in requirements
-export const ADMIN_SESSION_MAX_MS = 8 * 60 * 60 * 1000;
+// Persistent Admin session (365 days, renewed automatically on activity until explicit logout)
+export const ADMIN_SESSION_MAX_MS = 365 * 24 * 60 * 60 * 1000;
 export const STUDENT_SESSION_MAX_MS = 8 * 60 * 60 * 1000;
 
 export function hashPassword(password: string): string {
@@ -30,7 +25,13 @@ export function verifyPassword(password: string, storedHash: string): boolean {
 }
 
 function hashToken(rawToken: string): string {
-  return crypto.createHmac('sha256', getSessionSecret()).update(rawToken).digest('hex');
+  const configuredSecret = process.env.SESSION_SECRET?.trim();
+  if (configuredSecret) {
+    return crypto.createHmac('sha256', configuredSecret).update(rawToken).digest('hex');
+  }
+  // Deterministic SHA-256 for 256-bit CSPRNG opaque tokens when SESSION_SECRET is unset
+  // so Admin sessions survive server restarts without requiring re-login.
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
 }
 
 export function createSession(userId: string, role: UserRole): { token: string; expiresAtUtc: string } {
@@ -70,6 +71,7 @@ function isHttpsRequest(req?: Request): boolean {
 
 export function setSessionCookie(res: Response, token: string, expiresAtUtc: string, req?: Request): void {
   const expires = new Date(expiresAtUtc);
+  const maxAge = Math.max(0, expires.getTime() - Date.now());
   const https = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE_NAME, token, {
     httpOnly: true,
@@ -77,8 +79,18 @@ export function setSessionCookie(res: Response, token: string, expiresAtUtc: str
     sameSite: https ? 'none' : 'lax',
     ...(https ? { partitioned: true } : {}),
     expires,
+    maxAge,
     path: '/',
   });
+}
+
+export function extendAdminSessionIfNeeded(rawToken: string): string {
+  const tokenHash = hashToken(rawToken);
+  const nextExpiresUtc = new Date(Date.now() + ADMIN_SESSION_MAX_MS).toISOString();
+  db.prepare(
+    `UPDATE user_sessions SET expires_at_utc = ? WHERE token_hash = ? AND revoked_at_utc IS NULL`
+  ).run(nextExpiresUtc, tokenHash);
+  return nextExpiresUtc;
 }
 
 export function clearSessionCookie(res: Response, req?: Request): void {

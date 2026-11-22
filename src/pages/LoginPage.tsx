@@ -64,7 +64,7 @@ export const LoginPage: React.FC = () => {
     setSubmitting(true);
     try {
       await loginAdmin(adminIdentifier.trim(), adminPassword);
-      pushToast({ type: 'success', title: 'Sesi Admin aktif (maksimal 8 jam)' });
+      pushToast({ type: 'success', title: 'Login Admin berhasil — sesi tetap aktif di perangkat ini' });
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Gagal masuk sebagai Admin.');
     } finally {
@@ -347,7 +347,7 @@ export const LoginPage: React.FC = () => {
               <div>
                 <h2 className="text-xl font-bold text-[#20251D]">Masuk Konsol Admin</h2>
                 <p className="text-xs text-[#536F1A] mt-1">
-                  Akses khusus pengelola akademik. Masa sesi dibatasi maksimal 8 jam.
+                  Akses khusus pengelola akademik. Cukup login satu kali — sesi tetap aktif sampai Anda keluar.
                 </p>
               </div>
 

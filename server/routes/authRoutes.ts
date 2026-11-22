@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   clearSessionCookie,
   createSession,
+  extendAdminSessionIfNeeded,
   extractTokenFromRequest,
   getUserById,
   hasAnyAdmin,
@@ -209,6 +210,10 @@ authRouter.post('/student/login', (req, res) => {
 });
 
 authRouter.get('/me', requireAuth, (req: AuthenticatedRequest, res) => {
+  if (req.authUser?.role === 'ADMIN' && req.authToken) {
+    const nextExpiresUtc = extendAdminSessionIfNeeded(req.authToken);
+    setSessionCookie(res, req.authToken, nextExpiresUtc, req);
+  }
   res.json({ user: req.authUser });
 });
 
