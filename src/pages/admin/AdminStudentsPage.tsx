@@ -34,6 +34,7 @@ interface ExcelPreviewData {
     sheetName: string;
     suggestedClassId: string | null;
     suggestedClassName: string | null;
+    suggestedProdiId: string | null;
     totalRows: number;
     validRows: number;
     afkRows: number;
@@ -57,6 +58,7 @@ interface ExcelPreviewData {
     validationError: string | null;
     historicalWeeks: Record<number, string>;
   }>;
+  ignoredSheets?: Array<{ sheetName: string; reason: string }>;
 }
 
 export const AdminStudentsPage: React.FC = () => {
@@ -103,6 +105,7 @@ export const AdminStudentsPage: React.FC = () => {
   // Excel Import Modal
   const [excelModalOpen, setExcelModalOpen] = useState(false);
   const [excelPreview, setExcelPreview] = useState<ExcelPreviewData | null>(null);
+  const [excelError, setExcelError] = useState<string | null>(null);
   const [sheetClassMap, setSheetClassMap] = useState<Record<string, string>>({});
   const [importHistorical, setImportHistorical] = useState(true);
   const [importProgress, setImportProgress] = useState(0);
@@ -290,6 +293,8 @@ export const AdminStudentsPage: React.FC = () => {
     if (!file) return;
     const fd = new FormData();
     fd.append('file', file);
+    setExcelError(null);
+    setExcelPreview(null);
     setImporting(true);
     setImportProgress(30);
     abortRef.current = new AbortController();
@@ -302,13 +307,20 @@ export const AdminStudentsPage: React.FC = () => {
       setExcelPreview(preview);
       const map: Record<string, string> = {};
       for (const s of preview.sheets) {
-        map[s.sheetName] = s.suggestedClassId ?? classes[0]?.id ?? '';
+        const autoFallback = s.suggestedProdiId
+          ? `__AUTO__:${s.suggestedProdiId}`
+          : prodis[0]?.id
+            ? `__AUTO__:${prodis[0].id}`
+            : '';
+        map[s.sheetName] = s.suggestedClassId ?? classes[0]?.id ?? autoFallback;
       }
       setSheetClassMap(map);
       setImportProgress(100);
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
-        pushToast({ type: 'error', title: 'Gagal membaca Excel', description: err instanceof Error ? err.message : '' });
+        const msg = err instanceof Error ? err.message : 'Gagal membaca file Excel';
+        setExcelError(msg);
+        pushToast({ type: 'error', title: 'Gagal membaca Excel', description: msg });
       }
     } finally {
       setImporting(false);
@@ -318,11 +330,20 @@ export const AdminStudentsPage: React.FC = () => {
 
   const handleExcelCommit = async () => {
     if (!excelPreview) return;
+    setExcelError(null);
+    const unmapped = excelPreview.sheets.filter((sh) => !sheetClassMap[sh.sheetName]);
+    if (unmapped.length > 0) {
+      const msg = `Pilih kelas tujuan atau opsi buat kelas otomatis untuk sheet: ${unmapped.map((s) => s.sheetName).join(', ')}`;
+      setExcelError(msg);
+      pushToast({ type: 'error', title: 'Pemetaan kelas belum lengkap', description: msg });
+      return;
+    }
+
     setImporting(true);
     setImportProgress(25);
     abortRef.current = new AbortController();
     try {
-      const res = await apiRequest<{ created: number; updated: number; skipped: number }>(
+      const res = await apiRequest<{ created: number; updated: number; skipped: number; autoCreatedClasses?: number }>(
         '/api/admin/students/import-excel/commit',
         {
           method: 'POST',
@@ -338,14 +359,18 @@ export const AdminStudentsPage: React.FC = () => {
       pushToast({
         type: 'success',
         title: 'Import Excel Selesai',
-        description: `${res.created} dibuat, ${res.updated} diperbarui, ${res.skipped} dilewati.`,
+        description: `${res.created} dibuat, ${res.updated} diperbarui, ${res.skipped} dilewati${
+          res.autoCreatedClasses ? ` (${res.autoCreatedClasses} kelas baru dibuat otomatis)` : ''
+        }.`,
       });
       setExcelModalOpen(false);
       setExcelPreview(null);
-      await loadStudents();
+      await Promise.all([loadMeta(), loadStudents()]);
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
-        pushToast({ type: 'error', title: 'Gagal commit import', description: err instanceof Error ? err.message : '' });
+        const msg = err instanceof Error ? err.message : 'Gagal menyimpan data import';
+        setExcelError(msg);
+        pushToast({ type: 'error', title: 'Gagal commit import', description: msg });
       }
     } finally {
       setImporting(false);
@@ -378,6 +403,7 @@ export const AdminStudentsPage: React.FC = () => {
             type="button"
             onClick={() => {
               setExcelPreview(null);
+              setExcelError(null);
               setImportProgress(0);
               setExcelModalOpen(true);
             }}
@@ -820,14 +846,21 @@ export const AdminStudentsPage: React.FC = () => {
         <div className="space-y-4">
           <div className="rounded-2xl border border-dashed border-[#536F1A] bg-[#F0F8DF]/50 p-5 text-center space-y-3">
             <p className="text-xs text-[#20251D]">
-              Pilih workbook <strong>.xlsx</strong>. Pastikan kelas tujuan sudah dibuat di menu Prodi & Kelas.
+              Pilih workbook <strong>.xlsx</strong> atau <strong>.csv</strong> dengan kolom <strong>NIM/NPM</strong> dan{' '}
+              <strong>Nama</strong>. Jika kelas belum dibuat, Anda dapat membuat kelas otomatis langsung dari nama sheet.
             </p>
             <label className="inline-flex items-center gap-2 rounded-full bg-[#B5D45D] hover:bg-[#C5E370] text-[#171A17] px-5 py-2.5 text-xs font-bold cursor-pointer">
               <Upload className="w-4 h-4" />
-              Pilih File .xlsx
-              <input type="file" accept=".xlsx" onChange={handleExcelFileSelect} className="hidden" />
+              Pilih File .xlsx / .csv
+              <input type="file" accept=".xlsx,.csv" onChange={handleExcelFileSelect} className="hidden" />
             </label>
           </div>
+
+          {excelError && (
+            <div role="alert" className="rounded-2xl bg-red-50 border border-red-200 px-4 py-3 text-xs text-red-800">
+              {excelError}
+            </div>
+          )}
 
           {importing && (
             <div className="space-y-2">
@@ -852,6 +885,12 @@ export const AdminStudentsPage: React.FC = () => {
 
           {excelPreview && (
             <div className="space-y-4">
+              {excelPreview.ignoredSheets && excelPreview.ignoredSheets.length > 0 && (
+                <div className="rounded-xl bg-amber-50 border border-amber-200 px-3.5 py-2.5 text-xs text-amber-900">
+                  Sheet dilewati: {excelPreview.ignoredSheets.map((s) => `${s.sheetName} (${s.reason})`).join('; ')}
+                </div>
+              )}
+
               <div className="space-y-2">
                 <h4 className="text-xs font-bold text-[#20251D]">Pemetaan Sheet ke Kelas Tujuan</h4>
                 {excelPreview.sheets.map((sh) => (
@@ -871,14 +910,27 @@ export const AdminStudentsPage: React.FC = () => {
                       onChange={(e) =>
                         setSheetClassMap((prev) => ({ ...prev, [sh.sheetName]: e.target.value }))
                       }
-                      className="rounded-full border border-[#D5E4B6] bg-white px-3 py-1.5 text-xs"
+                      className="rounded-full border border-[#D5E4B6] bg-white px-3 py-1.5 text-xs max-w-full"
                     >
                       <option value="">-- Pilih Kelas --</option>
-                      {classes.map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.name} ({c.study_program_code})
-                        </option>
-                      ))}
+                      {classes.length > 0 && (
+                        <optgroup label="Kelas Tersedia">
+                          {classes.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name} ({c.study_program_code})
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {prodis.length > 0 && (
+                        <optgroup label="Buat Kelas Baru Otomatis dari Nama Sheet">
+                          {prodis.map((p) => (
+                            <option key={p.id} value={`__AUTO__:${p.id}`}>
+                              + Buat Kelas "{sh.sheetName}" ({p.code})
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
                     </select>
                   </div>
                 ))}

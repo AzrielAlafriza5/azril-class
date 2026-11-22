@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import ExcelJS from 'exceljs';
 import { db } from '../db/database.ts';
 import { formatWibDateTime } from '../../shared/time.ts';
@@ -25,6 +26,7 @@ export interface ParsedWorkbookPreview {
     sheetName: string;
     suggestedClassId: string | null;
     suggestedClassName: string | null;
+    suggestedProdiId: string | null;
     totalRows: number;
     validRows: number;
     afkRows: number;
@@ -33,11 +35,12 @@ export interface ParsedWorkbookPreview {
     invalidRows: number;
   }[];
   rows: ParsedExcelRow[];
+  ignoredSheets: { sheetName: string; reason: string }[];
 }
 
 function classifyFillColor(fill: ExcelJS.Fill | undefined): 'RED' | 'BLACK' | 'OTHER' {
-  if (!fill || fill.type !== 'pattern') return 'OTHER';
-  const fg = fill.fgColor;
+  if (!fill || fill.type !== 'pattern' || fill.pattern === 'none') return 'OTHER';
+  const fg = fill.fgColor ?? fill.bgColor;
   if (!fg || !fg.argb) return 'OTHER';
   const argb = fg.argb.toUpperCase();
   if (argb.length < 6) return 'OTHER';
@@ -61,7 +64,7 @@ function classifyFillColor(fill: ExcelJS.Fill | undefined): 'RED' | 'BLACK' | 'O
 function normalizeAttendanceValue(raw: unknown): AttendanceStatus | null {
   const s = String(raw ?? '').trim().toUpperCase();
   if (!s) return null;
-  if (s === 'H' || s === 'HADIR' || s === '1' || s === 'V' || s === 'OK') return 'Hadir';
+  if (s === 'H' || s === 'HADIR' || s === '1' || s === 'V' || s === 'OK' || s === '✓') return 'Hadir';
   if (s === 'I' || s === 'IZIN') return 'Izin';
   if (s === 'S' || s === 'SAKIT') return 'Sakit';
   if (s === 'A' || s === 'ALFA' || s === 'ALPHA' || s === '0') return 'Alfa';
@@ -70,21 +73,120 @@ function normalizeAttendanceValue(raw: unknown): AttendanceStatus | null {
 
 function cellToString(val: ExcelJS.CellValue): string {
   if (val === null || val === undefined) return '';
+  if (val instanceof Date) return val.toISOString();
   if (typeof val === 'object') {
-    if ('text' in val && val.text) return String(val.text).trim();
-    if ('result' in val && val.result !== undefined) return String(val.result).trim();
     if ('richText' in val && Array.isArray(val.richText)) {
       return val.richText.map((r) => r.text).join('').trim();
     }
+    if ('text' in val && val.text !== undefined) return String(val.text).trim();
+    if ('result' in val && val.result !== undefined) return String(val.result).trim();
+    if ('error' in val) return '';
   }
   return String(val).trim();
 }
 
-export async function parseStudentImportWorkbook(buffer: Buffer): Promise<ParsedWorkbookPreview> {
-  const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(buffer as unknown as ArrayBuffer);
+function matchHeaderKey(rawHeader: string): string | null {
+  const text = rawHeader
+    .replace(/^\uFEFF/, '')
+    .toLowerCase()
+    .replace(/[\s_.:/()-]+/g, ' ')
+    .trim();
+  if (!text) return null;
+  if (
+    text === 'nim' ||
+    text === 'npm' ||
+    text === 'nrp' ||
+    text.includes('nim') ||
+    text.includes('npm') ||
+    text.includes('no induk') ||
+    text.includes('nomor induk') ||
+    text === 'student id' ||
+    text === 'id mahasiswa'
+  ) {
+    return 'nim';
+  }
+  if (
+    text === 'nama' ||
+    text === 'name' ||
+    text.includes('nama') ||
+    text === 'mahasiswa' ||
+    text === 'full name'
+  ) {
+    return 'name';
+  }
+  if (text.includes('username') || text === 'user' || text === 'akun') return 'username';
+  if (text.includes('password') || text === 'sandi' || text === 'pwd') return 'password';
+  if (text.includes('angkatan') || text.includes('cohort') || text === 'tahun masuk') return 'cohort';
+  if (text.includes('semester') || text === 'smt' || text === 'smst') return 'semester';
 
-  const classes = db.prepare(`SELECT id, name FROM classes`).all() as { id: string; name: string }[];
+  const compact = text.replace(/\s+/g, '');
+  for (let w = 1; w <= 8; w++) {
+    if (
+      compact === `m${w}` ||
+      compact === `minggu${w}` ||
+      compact === `w${w}` ||
+      compact === `week${w}` ||
+      compact === `pertemuan${w}` ||
+      compact === `p${w}`
+    ) {
+      return `w${w}`;
+    }
+  }
+  return null;
+}
+
+export async function parseStudentImportWorkbook(
+  buffer: Buffer,
+  originalName: string = 'upload.xlsx'
+): Promise<ParsedWorkbookPreview> {
+  if (!buffer || buffer.length === 0) {
+    throw new Error('File yang diunggah kosong.');
+  }
+
+  // Detect legacy .xls (OLE2 Compound File magic bytes D0 CF 11 E0)
+  if (
+    buffer.length >= 4 &&
+    buffer[0] === 0xd0 &&
+    buffer[1] === 0xcf &&
+    buffer[2] === 0x11 &&
+    buffer[3] === 0xe0
+  ) {
+    throw new Error(
+      'Format Excel lama (.xls) belum didukung langsung. Silakan buka di Excel/Google Sheets lalu Save As sebagai .xlsx terlebih dahulu.'
+    );
+  }
+
+  const workbook = new ExcelJS.Workbook();
+  const isCsv = originalName.toLowerCase().endsWith('.csv');
+  if (isCsv) {
+    const csvText = buffer.toString('utf8').replace(/^\uFEFF/, '');
+    const sampleLines = csvText.split(/\r?\n/).slice(0, 5).join('\n');
+    const commaCount = (sampleLines.match(/,/g) ?? []).length;
+    const semiCount = (sampleLines.match(/;/g) ?? []).length;
+    const delimiter = semiCount > commaCount ? ';' : ',';
+    await workbook.csv.read(Readable.from([csvText]), {
+      parserOptions: { delimiter },
+    });
+  } else {
+    try {
+      await workbook.xlsx.load(buffer as unknown as ArrayBuffer);
+    } catch {
+      throw new Error(
+        'File tidak dapat dibaca sebagai workbook Excel (.xlsx). Pastikan format file adalah .xlsx yang valid atau .csv.'
+      );
+    }
+  }
+
+  const classes = db.prepare(`SELECT id, name, study_program_id FROM classes`).all() as {
+    id: string;
+    name: string;
+    study_program_id: string;
+  }[];
+  const prodis = db.prepare(`SELECT id, code, name FROM study_programs`).all() as {
+    id: string;
+    code: string;
+    name: string;
+  }[];
   const existingNims = new Set(
     (db.prepare(`SELECT nim FROM students`).all() as { nim: string }[]).map((r) => r.nim.toUpperCase())
   );
@@ -92,30 +194,25 @@ export async function parseStudentImportWorkbook(buffer: Buffer): Promise<Parsed
 
   const sheets: ParsedWorkbookPreview['sheets'] = [];
   const rows: ParsedExcelRow[] = [];
+  const ignoredSheets: ParsedWorkbookPreview['ignoredSheets'] = [];
 
   for (const ws of workbook.worksheets) {
-    if (ws.name.toLowerCase().includes('panduan') || ws.name.toLowerCase().includes('instruction')) {
+    const wsLower = ws.name.toLowerCase();
+    if (wsLower.includes('panduan') || wsLower.includes('instruction')) {
       continue;
     }
 
-    // Find header row (first row with NIM or Nama)
+    // Find header row in first 25 rows (many academic sheets have kop/title rows above headers)
     let headerRowIdx = 1;
     const colMap: Record<string, number> = {};
-    for (let r = 1; r <= Math.min(5, ws.rowCount); r++) {
+    const maxScan = Math.min(25, ws.rowCount || 0);
+    for (let r = 1; r <= maxScan; r++) {
       const row = ws.getRow(r);
       const found: Record<string, number> = {};
       row.eachCell((cell, colNumber) => {
-        const text = cellToString(cell.value).toLowerCase();
-        if (text === 'nim' || text.includes('nim')) found.nim = colNumber;
-        else if (text.includes('nama')) found.name = colNumber;
-        else if (text.includes('username')) found.username = colNumber;
-        else if (text.includes('password')) found.password = colNumber;
-        else if (text.includes('angkatan') || text.includes('cohort')) found.cohort = colNumber;
-        else if (text.includes('semester')) found.semester = colNumber;
-        for (let w = 1; w <= 8; w++) {
-          if (text === `m${w}` || text === `minggu ${w}` || text === `w${w}` || text === `week ${w}`) {
-            found[`w${w}`] = colNumber;
-          }
+        const key = matchHeaderKey(cellToString(cell.value));
+        if (key && !found[key]) {
+          found[key] = colNumber;
         }
       });
       if (found.nim && found.name) {
@@ -126,13 +223,19 @@ export async function parseStudentImportWorkbook(buffer: Buffer): Promise<Parsed
     }
 
     if (!colMap.nim || !colMap.name) {
+      ignoredSheets.push({
+        sheetName: ws.name,
+        reason: 'Tidak ditemukan header kolom NIM/NPM dan Nama pada 25 baris pertama.',
+      });
       continue;
     }
 
     const matchedClass = classes.find(
-      (c) => c.name.toLowerCase() === ws.name.trim().toLowerCase() ||
-        ws.name.toLowerCase().includes(c.name.toLowerCase())
+      (c) => c.name.toLowerCase() === ws.name.trim().toLowerCase() || wsLower.includes(c.name.toLowerCase())
     );
+    const matchedProdi =
+      prodis.find((p) => wsLower.includes(p.code.toLowerCase()) || wsLower.includes(p.name.toLowerCase())) ??
+      prodis[0];
 
     let totalRows = 0;
     let validRows = 0;
@@ -149,9 +252,10 @@ export async function parseStudentImportWorkbook(buffer: Buffer): Promise<Parsed
 
       totalRows += 1;
 
-      // Check fill colors across key cells (NIM, Name, or whole row)
+      // Check fill colors across key columns (NIM, Name, or columns 1..6)
       let colorFlag: 'RED' | 'BLACK' | 'OTHER' = 'OTHER';
-      for (const cIdx of [colMap.nim, colMap.name, 1]) {
+      const checkCols = Array.from(new Set([colMap.nim, colMap.name, 1, 2, 3]));
+      for (const cIdx of checkCols) {
         const cellFill = classifyFillColor(row.getCell(cIdx).fill);
         if (cellFill === 'BLACK') {
           colorFlag = 'BLACK';
@@ -184,7 +288,7 @@ export async function parseStudentImportWorkbook(buffer: Buffer): Promise<Parsed
 
       let validationError: string | null = null;
       if (!skipBlack) {
-        if (!nimClean || nimClean.length < 4 || !/^[A-Za-z0-9.-]+$/.test(nimClean)) {
+        if (!nimClean || nimClean.length < 4 || !/^[A-Za-z0-9._-]+$/.test(nimClean)) {
           validationError = 'NIM tidak valid (minimal 4 karakter alfanumerik)';
         } else if (!nameRaw || nameRaw.length < 2) {
           validationError = 'Nama lengkap wajib diisi';
@@ -228,6 +332,7 @@ export async function parseStudentImportWorkbook(buffer: Buffer): Promise<Parsed
       sheetName: ws.name,
       suggestedClassId: matchedClass?.id ?? null,
       suggestedClassName: matchedClass?.name ?? null,
+      suggestedProdiId: matchedClass?.study_program_id ?? matchedProdi?.id ?? null,
       totalRows,
       validRows,
       afkRows,
@@ -237,7 +342,7 @@ export async function parseStudentImportWorkbook(buffer: Buffer): Promise<Parsed
     });
   }
 
-  return { sheets, rows };
+  return { sheets, rows, ignoredSheets };
 }
 
 export async function buildStudentTemplateWorkbook(): Promise<Buffer> {

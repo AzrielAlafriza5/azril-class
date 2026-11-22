@@ -679,11 +679,21 @@ adminRouter.delete('/students/:id', (req: AuthenticatedRequest, res) => {
 
 adminRouter.post('/students/import-excel/preview', memoryUpload.single('file'), async (req, res) => {
   if (!req.file) {
-    res.status(400).json({ error: 'File Excel (.xlsx) wajib diunggah.' });
+    res.status(400).json({ error: 'File Excel (.xlsx) atau CSV wajib diunggah.' });
     return;
   }
   try {
-    const preview = await parseStudentImportWorkbook(req.file.buffer);
+    const preview = await parseStudentImportWorkbook(req.file.buffer, req.file.originalname);
+    if (preview.sheets.length === 0) {
+      const detail =
+        preview.ignoredSheets.length > 0
+          ? ` Sheet ditemukan: ${preview.ignoredSheets.map((s) => `"${s.sheetName}" (${s.reason})`).join('; ')}`
+          : ' Pastikan minimal ada 1 sheet berisi kolom NIM/NPM dan Nama.';
+      res.status(400).json({
+        error: `Tidak ada sheet yang dapat diimpor.${detail}`,
+      });
+      return;
+    }
     res.json(preview);
   } catch (err) {
     res.status(400).json({
@@ -717,86 +727,165 @@ adminRouter.post('/students/import-excel/commit', (req: AuthenticatedRequest, re
     return;
   }
 
+  const validInputSheets = new Set(
+    rows.filter((r) => !r.skipBlack && !r.validationError && !r.isDuplicateInFile).map((r) => r.sheetName)
+  );
+  const unmappedSheets = Array.from(validInputSheets).filter((s) => !sheetClassMap[s]);
+  if (unmappedSheets.length > 0) {
+    res.status(400).json({
+      error: `Pilih kelas tujuan atau buat kelas otomatis terlebih dahulu untuk sheet: ${unmappedSheets.join(', ')}`,
+    });
+    return;
+  }
+
   const classProdiMap = new Map(
     (db.prepare(`SELECT id, study_program_id FROM classes`).all() as { id: string; study_program_id: string }[]).map(
       (c) => [c.id, c.study_program_id]
     )
   );
+  const validProdis = new Set(
+    (db.prepare(`SELECT id FROM study_programs`).all() as { id: string }[]).map((p) => p.id)
+  );
+  const settings = db
+    .prepare(`SELECT active_academic_year FROM academic_settings WHERE id = 1`)
+    .get() as { active_academic_year: string } | undefined;
 
   let created = 0;
   let updated = 0;
   let skipped = 0;
+  let autoCreatedClasses = 0;
 
-  withTransaction(() => {
-    for (const r of rows) {
-      if (r.skipBlack || r.validationError || r.isDuplicateInFile) {
-        skipped += 1;
-        continue;
-      }
-      const classId = sheetClassMap[r.sheetName];
-      const prodiId = classProdiMap.get(classId);
-      if (!classId || !prodiId) {
-        skipped += 1;
-        continue;
-      }
-
-      let studentId: string;
-      const existing = db.prepare(`SELECT id, user_id FROM students WHERE upper(nim) = upper(?)`).get(r.nim) as
-        | { id: string; user_id: string }
-        | undefined;
-
-      if (existing) {
-        studentId = existing.id;
-        db.prepare(
-          `UPDATE students SET full_name = ?, study_program_id = ?, class_id = ?, cohort_year = ?, semester = ?, badge = ?, updated_at = ? WHERE id = ?`
-        ).run(r.fullName, prodiId, classId, r.cohortYear, r.semester, r.badge, new Date().toISOString(), studentId);
-        updated += 1;
-      } else {
-        const userId = newId();
-        studentId = newId();
-        const baseUsername = r.username.toLowerCase().replace(/[^a-z0-9._-]/g, '') || r.nim.toLowerCase();
-        const clash = db.prepare(`SELECT 1 FROM user_profiles WHERE lower(username) = ?`).get(baseUsername);
-        const finalUsername = clash ? `${baseUsername}_${r.nim.toLowerCase()}` : baseUsername;
-
-        db.prepare(
-          `INSERT INTO user_profiles (id, username, password_hash, full_name, role, is_active)
-           VALUES (?, ?, ?, ?, 'MAHASISWA', 1)`
-        ).run(userId, finalUsername, hashPassword(r.password || r.nim), r.fullName);
-
-        db.prepare(
-          `INSERT INTO students (id, user_id, nim, full_name, study_program_id, class_id, cohort_year, semester, badge)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(studentId, userId, r.nim, r.fullName, prodiId, classId, r.cohortYear, r.semester, r.badge);
-
-        db.prepare(
-          `INSERT INTO student_streaks (id, student_id, current_streak, longest_streak, updated_at_utc)
-           VALUES (?, ?, 0, 0, ?)`
-        ).run(newId(), studentId, new Date().toISOString());
-        created += 1;
-      }
-
-      if (importHistorical && r.historicalWeeks) {
-        for (let w = 1; w <= 8; w++) {
-          const st = r.historicalWeeks[w];
-          if (st) {
+  try {
+    withTransaction(() => {
+      // Resolve or auto-create classes mapped as __AUTO__:<prodiId>
+      const resolvedClassMap = new Map<string, { classId: string; prodiId: string }>();
+      for (const sheetName of validInputSheets) {
+        const mappedVal = sheetClassMap[sheetName] ?? '';
+        if (mappedVal.startsWith('__AUTO__:')) {
+          const prodiId = mappedVal.slice('__AUTO__:'.length).trim();
+          if (!validProdis.has(prodiId)) {
+            throw new Error(`Program studi untuk sheet "${sheetName}" tidak valid.`);
+          }
+          const cleanClassName = sheetName.trim().slice(0, 60) || 'Kelas Baru';
+          const existingCls = db
+            .prepare(`SELECT id, study_program_id FROM classes WHERE lower(name) = lower(?) AND study_program_id = ?`)
+            .get(cleanClassName, prodiId) as { id: string; study_program_id: string } | undefined;
+          if (existingCls) {
+            resolvedClassMap.set(sheetName, { classId: existingCls.id, prodiId: existingCls.study_program_id });
+          } else {
+            const newClassId = newId();
+            const firstRow = rows.find((r) => r.sheetName === sheetName && !r.skipBlack);
             db.prepare(
-              `INSERT INTO historical_attendance (id, student_id, week_number, status, imported_by_admin_id, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(student_id, week_number) DO UPDATE SET
-                 status = excluded.status,
-                 imported_by_admin_id = excluded.imported_by_admin_id,
-                 updated_at = excluded.updated_at`
-            ).run(newId(), studentId, w, st, req.authUser!.id, new Date().toISOString());
+              `INSERT INTO classes (id, name, study_program_id, semester, academic_year, homeroom_lecturer)
+               VALUES (?, ?, ?, ?, ?, '')`
+            ).run(
+              newClassId,
+              cleanClassName,
+              prodiId,
+              firstRow?.semester ?? 1,
+              settings?.active_academic_year ?? '2026/2027'
+            );
+            autoCreatedClasses += 1;
+            resolvedClassMap.set(sheetName, { classId: newClassId, prodiId });
+          }
+        } else {
+          const prodiId = classProdiMap.get(mappedVal);
+          if (mappedVal && prodiId) {
+            resolvedClassMap.set(sheetName, { classId: mappedVal, prodiId });
           }
         }
-        recalculateStudentAttendanceAndQuotas(studentId, req.authUser!.id);
       }
-    }
 
-    logAdminActivity(req.authUser!.id, 'IMPORT_EXCEL_STUDENTS', 'students', '', { created, updated, skipped });
-  });
+      for (const r of rows) {
+        if (r.skipBlack || r.validationError || r.isDuplicateInFile) {
+          skipped += 1;
+          continue;
+        }
+        const target = resolvedClassMap.get(r.sheetName);
+        if (!target) {
+          skipped += 1;
+          continue;
+        }
+        const { classId, prodiId } = target;
 
-  res.json({ created, updated, skipped });
+        let studentId: string;
+        const existing = db.prepare(`SELECT id, user_id FROM students WHERE upper(nim) = upper(?)`).get(r.nim) as
+          | { id: string; user_id: string }
+          | undefined;
+
+        if (existing) {
+          studentId = existing.id;
+          db.prepare(`UPDATE user_profiles SET full_name = ?, updated_at = ? WHERE id = ?`).run(
+            r.fullName,
+            new Date().toISOString(),
+            existing.user_id
+          );
+          db.prepare(
+            `UPDATE students SET full_name = ?, study_program_id = ?, class_id = ?, cohort_year = ?, semester = ?, badge = ?, updated_at = ? WHERE id = ?`
+          ).run(r.fullName, prodiId, classId, r.cohortYear, r.semester, r.badge, new Date().toISOString(), studentId);
+          updated += 1;
+        } else {
+          const userId = newId();
+          studentId = newId();
+          const baseUsername = r.username.toLowerCase().replace(/[^a-z0-9._-]/g, '') || r.nim.toLowerCase();
+          let finalUsername = baseUsername;
+          if (db.prepare(`SELECT 1 FROM user_profiles WHERE lower(username) = ?`).get(finalUsername)) {
+            finalUsername = `${baseUsername}_${r.nim.toLowerCase()}`;
+          }
+          let suffix = 2;
+          while (db.prepare(`SELECT 1 FROM user_profiles WHERE lower(username) = ?`).get(finalUsername)) {
+            finalUsername = `${baseUsername}_${r.nim.toLowerCase()}_${suffix++}`;
+          }
+
+          db.prepare(
+            `INSERT INTO user_profiles (id, username, password_hash, full_name, role, is_active)
+             VALUES (?, ?, ?, ?, 'MAHASISWA', 1)`
+          ).run(userId, finalUsername, hashPassword(r.password || r.nim), r.fullName);
+
+          db.prepare(
+            `INSERT INTO students (id, user_id, nim, full_name, study_program_id, class_id, cohort_year, semester, badge)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(studentId, userId, r.nim, r.fullName, prodiId, classId, r.cohortYear, r.semester, r.badge);
+
+          db.prepare(
+            `INSERT INTO student_streaks (id, student_id, current_streak, longest_streak, updated_at_utc)
+             VALUES (?, ?, 0, 0, ?)`
+          ).run(newId(), studentId, new Date().toISOString());
+          created += 1;
+        }
+
+        if (importHistorical && r.historicalWeeks) {
+          for (let w = 1; w <= 8; w++) {
+            const st = r.historicalWeeks[w];
+            if (st) {
+              db.prepare(
+                `INSERT INTO historical_attendance (id, student_id, week_number, status, imported_by_admin_id, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(student_id, week_number) DO UPDATE SET
+                   status = excluded.status,
+                   imported_by_admin_id = excluded.imported_by_admin_id,
+                   updated_at = excluded.updated_at`
+              ).run(newId(), studentId, w, st, req.authUser!.id, new Date().toISOString());
+            }
+          }
+          recalculateStudentAttendanceAndQuotas(studentId, req.authUser!.id);
+        }
+      }
+
+      logAdminActivity(req.authUser!.id, 'IMPORT_EXCEL_STUDENTS', 'students', '', {
+        created,
+        updated,
+        skipped,
+        autoCreatedClasses,
+      });
+    });
+
+    res.json({ created, updated, skipped, autoCreatedClasses });
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'Gagal menyimpan data import Excel.',
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
