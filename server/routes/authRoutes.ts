@@ -1,31 +1,44 @@
 import { Router } from 'express';
 import {
+  CANONICAL_ADMIN_EMAIL,
+  CANONICAL_ADMIN_USERNAME,
   clearSessionCookie,
   createSession,
   extendAdminSessionIfNeeded,
   extractTokenFromRequest,
   getUserById,
   hasAnyAdmin,
+  hashPassword,
+  logAdminActivity,
+  pushAdminToSupabaseIfConfigured,
   requireAuth,
   revokeSession,
   setSessionCookie,
+  syncAdminFromSupabaseIfNeeded,
   syncEnvBootstrapAdminIfNeeded,
   verifyPassword,
   type AuthenticatedRequest,
 } from '../auth.ts';
-import { db, isSupabaseConfigured, withTransaction } from '../db/database.ts';
+import { db, isSupabaseConfigured, newId, withTransaction } from '../db/database.ts';
 import { isGeminiConfigured } from '../services/aiService.ts';
 import { awardDailyLoginAndStreak } from '../services/xpService.ts';
 
 export const authRouter = Router();
 
-authRouter.get('/status', (_req, res) => {
-  const settings = db.prepare(`SELECT institution_name, active_academic_year, active_semester FROM academic_settings WHERE id = 1`).get() as
+authRouter.get('/status', async (_req, res) => {
+  if (!hasAnyAdmin()) {
+    await syncAdminFromSupabaseIfNeeded();
+  }
+  const settings = db
+    .prepare(`SELECT institution_name, active_academic_year, active_semester FROM academic_settings WHERE id = 1`)
+    .get() as
     | { institution_name: string; active_academic_year: string; active_semester: string }
     | undefined;
+  const adminUsername = (process.env.ADMIN_BOOTSTRAP_USERNAME?.trim() || CANONICAL_ADMIN_USERNAME).toLowerCase();
   res.json({
     hasAdmin: hasAnyAdmin(),
     envBootstrapConfigured: Boolean(process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()),
+    adminUsername,
     supabaseConfigured: isSupabaseConfigured(),
     geminiConfigured: isGeminiConfigured(),
     institutionName: settings?.institution_name ?? 'AZRIL CLAS Academic',
@@ -36,24 +49,74 @@ authRouter.get('/status', (_req, res) => {
 
 authRouter.post('/admin/bootstrap', (_req, res) => {
   res.status(403).json({
-    error: 'Pendaftaran akun Admin dinonaktifkan. Portal Admin hanya menggunakan satu akun Admin resmi.',
+    error: 'Pendaftaran Admin tidak tersedia. Gunakan satu akun Admin yang sudah ditetapkan.',
   });
 });
 
-authRouter.post('/admin/login', (req, res) => {
-  const { identifier, password } = req.body as { identifier?: string; password?: string };
-  const cleanId = String(identifier ?? '').trim().toLowerCase();
+authRouter.post('/admin/activate', async (req, res) => {
+  await syncAdminFromSupabaseIfNeeded();
+  if (hasAnyAdmin() || process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()) {
+    res.status(403).json({
+      error: 'Akun Admin sudah aktif.',
+    });
+    return;
+  }
+
+  const { password } = req.body as { password?: string };
+  const trimmedPass = String(password ?? '').trim();
+  if (trimmedPass.length < 6) {
+    res.status(400).json({ error: 'Password Admin minimal 6 karakter.' });
+    return;
+  }
+
+  try {
+    const adminId = withTransaction(() => {
+      if (hasAnyAdmin()) {
+        throw new Error('ALREADY_ACTIVE');
+      }
+      const id = newId();
+      db.prepare(
+        `INSERT INTO user_profiles (id, username, email, password_hash, full_name, role, is_active, last_login_at)
+         VALUES (?, ?, ?, ?, 'Administrator Utama', 'ADMIN', 1, ?)`
+      ).run(id, CANONICAL_ADMIN_USERNAME, CANONICAL_ADMIN_EMAIL, hashPassword(trimmedPass), new Date().toISOString());
+      logAdminActivity(id, 'ADMIN_ACTIVATE', 'user_profiles', id, { username: CANONICAL_ADMIN_USERNAME });
+      return id;
+    });
+
+    await pushAdminToSupabaseIfConfigured(adminId);
+    const { token, expiresAtUtc } = createSession(adminId, 'ADMIN');
+    setSessionCookie(res, token, expiresAtUtc, req);
+    const user = getUserById(adminId);
+    res.status(201).json({ token, expiresAtUtc, user });
+  } catch (err) {
+    if (err instanceof Error && err.message === 'ALREADY_ACTIVE') {
+      res.status(403).json({ error: 'Akun Admin sudah aktif.' });
+      return;
+    }
+    res.status(500).json({ error: 'Gagal menyimpan password Admin.' });
+  }
+});
+
+authRouter.post('/admin/login', async (req, res) => {
+  const { username, identifier, password } = req.body as {
+    username?: string;
+    identifier?: string;
+    password?: string;
+  };
+  const cleanId = String(username ?? identifier ?? '').trim().toLowerCase();
   const rawPass = String(password ?? '');
   const trimmedPass = rawPass.trim();
 
   if (!cleanId || !trimmedPass) {
-    res.status(400).json({ error: 'Username/email dan password wajib diisi.' });
+    res.status(400).json({ error: 'Username dan password Admin wajib diisi.' });
     return;
   }
 
-  // Ensure env-configured admin credentials are synced if set
+  // Ensure env-configured admin or Supabase-backed admin is synced
   if (process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()) {
     syncEnvBootstrapAdminIfNeeded();
+  } else if (!hasAnyAdmin()) {
+    await syncAdminFromSupabaseIfNeeded();
   }
 
   const row = db
@@ -67,22 +130,15 @@ authRouter.post('/admin/login', (req, res) => {
     | { id: string; password_hash: string; role: string; is_active: number }
     | undefined;
 
-  const isNonProd = process.env.NODE_ENV !== 'production';
-
   if (!row) {
     if (!hasAnyAdmin() && !process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()) {
       res.status(401).json({
-        error: 'Akun Admin belum dikonfigurasi di server. Pastikan ADMIN_BOOTSTRAP_PASSWORD sudah disetel di Secrets / Environment Variables.',
+        error: 'Password Admin belum dibuat untuk server ini. Silakan atur password Admin terlebih dahulu.',
+        needsActivation: true,
       });
       return;
     }
-    if (isNonProd) {
-      res.status(401).json({
-        error: 'Kredensial Admin tidak valid (username/email Admin tidak ditemukan).',
-      });
-    } else {
-      res.status(401).json({ error: 'Kredensial Admin tidak valid.' });
-    }
+    res.status(401).json({ error: 'Username atau password Admin salah.' });
     return;
   }
 
@@ -91,11 +147,7 @@ authRouter.post('/admin/login', (req, res) => {
     (trimmedPass !== rawPass && verifyPassword(trimmedPass, row.password_hash));
 
   if (!passwordValid) {
-    res.status(401).json({
-      error: isNonProd
-        ? 'Kredensial Admin tidak valid (password tidak sesuai).'
-        : 'Kredensial Admin tidak valid.',
-    });
+    res.status(401).json({ error: 'Username atau password Admin salah.' });
     return;
   }
 

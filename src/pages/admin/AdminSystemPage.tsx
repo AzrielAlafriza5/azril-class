@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Bell, CheckCheck, Settings, Shield } from 'lucide-react';
+import { Bell, CheckCheck, KeyRound, Settings, Shield } from 'lucide-react';
 import { apiRequest } from '../../lib/api';
 import { useAuth } from '../../context/AuthContext';
 import { TableSkeleton } from '../../components/ui/Skeletons';
@@ -19,14 +19,20 @@ interface AuditLogRow {
 }
 
 export const AdminSystemPage: React.FC<{ onUnreadChange?: () => void }> = ({ onUnreadChange }) => {
-  const { pushToast, refreshSystemStatus } = useAuth();
-  const [tab, setTab] = useState<'notifications' | 'settings' | 'audit'>('notifications');
+  const { user, systemStatus, pushToast, refreshSystemStatus } = useAuth();
+  const [tab, setTab] = useState<'notifications' | 'settings' | 'security' | 'audit'>('notifications');
   const [notifFilter, setNotifFilter] = useState<'all' | 'unread'>('all');
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [settings, setSettings] = useState<AcademicSettings | null>(null);
   const [logs, setLogs] = useState<AuditLogRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Admin password change state
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [savingPassword, setSavingPassword] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -89,6 +95,44 @@ export const AdminSystemPage: React.FC<{ onUnreadChange?: () => void }> = ({ onU
     }
   };
 
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPassword.trim().length < 6) {
+      pushToast({ type: 'error', title: 'Password baru minimal 6 karakter' });
+      return;
+    }
+    if (newPassword.trim() !== confirmPassword.trim()) {
+      pushToast({ type: 'error', title: 'Konfirmasi password baru tidak cocok' });
+      return;
+    }
+    setSavingPassword(true);
+    try {
+      await apiRequest('/api/admin/change-password', {
+        method: 'POST',
+        body: JSON.stringify({
+          currentPassword,
+          newPassword: newPassword.trim(),
+        }),
+      });
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      pushToast({
+        type: 'success',
+        title: 'Password Admin diperbarui',
+        description: 'Sesi Anda saat ini tetap aktif.',
+      });
+    } catch (err) {
+      pushToast({
+        type: 'error',
+        title: 'Gagal mengubah password',
+        description: err instanceof Error ? err.message : '',
+      });
+    } finally {
+      setSavingPassword(false);
+    }
+  };
+
   if (loading) return <TableSkeleton />;
   if (error) return <ErrorState message={error} onRetry={load} />;
 
@@ -114,6 +158,16 @@ export const AdminSystemPage: React.FC<{ onUnreadChange?: () => void }> = ({ onU
         >
           <Settings className="w-3.5 h-3.5" />
           Pengaturan Sistem
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab('security')}
+          className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-semibold ${
+            tab === 'security' ? 'bg-[#171A17] text-[#B5D45D]' : 'text-[#536F1A]'
+          }`}
+        >
+          <KeyRound className="w-3.5 h-3.5" />
+          Keamanan Admin
         </button>
         <button
           type="button"
@@ -268,6 +322,82 @@ export const AdminSystemPage: React.FC<{ onUnreadChange?: () => void }> = ({ onU
             Simpan Pengaturan
           </button>
         </form>
+      )}
+
+      {tab === 'security' && (
+        <div className="rounded-2xl bg-white border border-[#D5E4B6] p-6 space-y-5 max-w-2xl">
+          <div>
+            <h3 className="text-base font-bold text-[#20251D]">Keamanan Akun Admin Tunggal</h3>
+            <p className="text-xs text-[#536F1A] mt-1">
+              Sistem menggunakan 1 akun Admin utama dengan sesi login persisten sampai Anda menekan Keluar.
+            </p>
+          </div>
+
+          <div className="rounded-2xl bg-[#F0F8DF] border border-[#D5E4B6] p-4 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div>
+              <p className="text-[#536F1A] font-medium">Username Admin</p>
+              <p className="font-mono font-bold text-sm text-[#20251D] mt-0.5">{user?.username || 'azriel-admin'}</p>
+            </div>
+            <div>
+              <p className="text-[#536F1A] font-medium">Status Login</p>
+              <p className="font-semibold text-sm text-[#20251D] mt-0.5">Aktif 1x Login (Persisten)</p>
+            </div>
+          </div>
+
+          {systemStatus?.envBootstrapConfigured ? (
+            <div className="rounded-2xl bg-[#F0F8DF]/60 border border-[#D5E4B6] p-4 text-xs text-[#20251D] leading-relaxed">
+              Password Admin saat ini dikelola melalui konfigurasi Secrets / Environment server (
+              <span className="font-mono">ADMIN_BOOTSTRAP_PASSWORD</span>) sehingga tetap sinkron otomatis saat server
+              restart atau deploy. Ubah password langsung di panel Secrets / Vercel Environment Variables bila ingin
+              menggantinya.
+            </div>
+          ) : (
+            <form onSubmit={handleChangePassword} className="space-y-4 pt-2 border-t border-[#EBF3DA]">
+              <h4 className="text-sm font-bold text-[#20251D]">Ubah Password Admin</h4>
+              <div>
+                <label className="block text-xs font-semibold mb-1">Password Saat Ini</label>
+                <input
+                  type="password"
+                  required
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  className="w-full rounded-full border border-[#D5E4B6] px-4 py-2 text-sm"
+                />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-semibold mb-1">Password Baru (min. 6 karakter)</label>
+                  <input
+                    type="password"
+                    required
+                    minLength={6}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="w-full rounded-full border border-[#D5E4B6] px-4 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold mb-1">Ulangi Password Baru</label>
+                  <input
+                    type="password"
+                    required
+                    minLength={6}
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    className="w-full rounded-full border border-[#D5E4B6] px-4 py-2 text-sm"
+                  />
+                </div>
+              </div>
+              <button
+                type="submit"
+                disabled={savingPassword}
+                className="rounded-full bg-[#171A17] hover:bg-[#232822] text-[#B5D45D] px-6 py-2.5 text-xs font-bold disabled:opacity-60"
+              >
+                {savingPassword ? 'Menyimpan...' : 'Simpan Password Baru'}
+              </button>
+            </form>
+          )}
+        </div>
       )}
 
       {tab === 'audit' && (

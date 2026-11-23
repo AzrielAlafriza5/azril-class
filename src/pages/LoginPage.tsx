@@ -4,7 +4,7 @@ import { useAuth } from '../context/AuthContext';
 import { PWAInstallButton } from '../components/ui/PWAInstallButton';
 
 export const LoginPage: React.FC = () => {
-  const { systemStatus, loginAdmin, loginStudent, pushToast } = useAuth();
+  const { systemStatus, loginAdmin, activateSingleAdmin, refreshSystemStatus, loginStudent, pushToast } = useAuth();
   const [portal, setPortal] = useState<'MAHASISWA' | 'ADMIN'>('MAHASISWA');
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -17,6 +17,11 @@ export const LoginPage: React.FC = () => {
   // Admin login state
   const [adminIdentifier, setAdminIdentifier] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
+
+  // Locked single-admin first-time password activation (shown ONLY if server has no Admin & no env secret)
+  const [activationPassword, setActivationPassword] = useState('');
+  const needsAdminActivation =
+    portal === 'ADMIN' && systemStatus && !systemStatus.hasAdmin && !systemStatus.envBootstrapConfigured;
 
   const handleStudentSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -58,6 +63,30 @@ export const LoginPage: React.FC = () => {
       pushToast({ type: 'success', title: 'Login Admin berhasil — sesi tetap aktif di perangkat ini' });
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Gagal masuk sebagai Admin.');
+      void refreshSystemStatus();
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleAdminActivate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    if (activationPassword.trim().length < 6) {
+      setErrorMsg('Password Admin minimal 6 karakter.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await activateSingleAdmin(activationPassword.trim());
+      pushToast({
+        type: 'success',
+        title: 'Akun Admin Diaktifkan',
+        description: 'Anda masuk sebagai azriel-admin — sesi tetap aktif di perangkat ini.',
+      });
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Gagal mengaktifkan akun Admin.');
+      void refreshSystemStatus();
     } finally {
       setSubmitting(false);
     }
@@ -232,18 +261,70 @@ export const LoginPage: React.FC = () => {
                 Akun mahasiswa dikelola penuh oleh Admin. Hubungi Admin jika Anda memerlukan bantuan atau reset akun.
               </p>
             </form>
+          ) : needsAdminActivation ? (
+            <form onSubmit={handleAdminActivate} className="space-y-4">
+              <div>
+                <h2 className="text-xl font-bold text-[#20251D]">Atur Password Admin</h2>
+                <p className="text-xs text-[#536F1A] mt-1">
+                  Masuk pertama kali. Tetapkan password untuk akun Admin tunggal di bawah ini.
+                </p>
+              </div>
+
+              <div className="rounded-2xl bg-[#F0F8DF] border border-[#D5E4B6] px-4 py-3 text-xs flex items-center justify-between">
+                <span className="font-semibold text-[#20251D]">Username Admin</span>
+                <span className="font-mono font-bold text-[#536F1A]">
+                  {systemStatus?.adminUsername || 'azriel-admin'}
+                </span>
+              </div>
+
+              <div className="space-y-1.5">
+                <label htmlFor="admin-activate-pass" className="block text-xs font-semibold text-[#20251D]">
+                  Buat Password Admin (min. 6 karakter)
+                </label>
+                <div className="relative">
+                  <Lock className="w-4 h-4 text-[#536F1A] absolute left-4 top-1/2 -translate-y-1/2" />
+                  <input
+                    id="admin-activate-pass"
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    value={activationPassword}
+                    onChange={(e) => setActivationPassword(e.target.value)}
+                    placeholder="Buat password Admin"
+                    className="w-full rounded-full border border-[#D5E4B6] bg-[#F0F8DF]/40 pl-11 pr-12 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#B5D45D]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-[#536F1A]"
+                    aria-label={showPassword ? 'Sembunyikan password' : 'Tampilkan password'}
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={submitting}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-full bg-[#171A17] hover:bg-[#232822] text-[#B5D45D] font-bold py-3.5 text-sm transition-colors min-h-[48px]"
+              >
+                {submitting ? 'Menyimpan...' : 'Simpan Password & Masuk'}
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            </form>
           ) : (
             <form onSubmit={handleAdminSubmit} className="space-y-5">
               <div>
-                <h2 className="text-xl font-bold text-[#20251D]">Masuk Konsol Admin</h2>
+                <h2 className="text-xl font-bold text-[#20251D]">Masuk Admin</h2>
                 <p className="text-xs text-[#536F1A] mt-1">
-                  Akses khusus pengelola akademik tunggal. Cukup login satu kali — sesi tetap aktif sampai Anda keluar.
+                  Satu akun Admin untuk mengelola seluruh kelas. Cukup login sekali — sesi tetap aktif sampai Anda keluar.
                 </p>
               </div>
 
               <div className="space-y-1.5">
                 <label htmlFor="admin-id" className="block text-xs font-semibold text-[#20251D]">
-                  Username atau Email Admin
+                  Username Admin
                 </label>
                 <div className="relative">
                   <ShieldCheck className="w-4 h-4 text-[#536F1A] absolute left-4 top-1/2 -translate-y-1/2" />
@@ -253,7 +334,7 @@ export const LoginPage: React.FC = () => {
                     autoComplete="username"
                     value={adminIdentifier}
                     onChange={(e) => setAdminIdentifier(e.target.value)}
-                    placeholder="azriel-admin atau azrilalafriza5@gmail.com"
+                    placeholder={systemStatus?.adminUsername || 'azriel-admin'}
                     className="w-full rounded-full border border-[#D5E4B6] bg-[#F0F8DF]/40 pl-11 pr-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#B5D45D]"
                   />
                 </div>

@@ -1,12 +1,15 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { db, newId } from './db/database.ts';
+import { db, getSupabaseAdminClient, newId } from './db/database.ts';
 import type { AuthUser, UserRole } from '../shared/types.ts';
+
+export const CANONICAL_ADMIN_USERNAME = 'azriel-admin';
+export const CANONICAL_ADMIN_EMAIL = 'azrilalafriza5@gmail.com';
 
 export const SESSION_COOKIE_NAME = 'azril_clas_session';
 // Persistent Admin session (365 days, renewed automatically on activity until explicit logout)
 export const ADMIN_SESSION_MAX_MS = 365 * 24 * 60 * 60 * 1000;
-export const STUDENT_SESSION_MAX_MS = 8 * 60 * 60 * 1000;
+export const STUDENT_SESSION_MAX_MS = 24 * 60 * 60 * 1000;
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -54,6 +57,21 @@ export function revokeSession(rawToken: string): void {
     new Date().toISOString(),
     tokenHash
   );
+}
+
+export function revokeOtherSessions(userId: string, keepRawToken?: string): void {
+  const now = new Date().toISOString();
+  if (keepRawToken) {
+    const keepHash = hashToken(keepRawToken);
+    db.prepare(
+      `UPDATE user_sessions SET revoked_at_utc = ? WHERE user_id = ? AND token_hash != ? AND revoked_at_utc IS NULL`
+    ).run(now, userId, keepHash);
+  } else {
+    db.prepare(`UPDATE user_sessions SET revoked_at_utc = ? WHERE user_id = ? AND revoked_at_utc IS NULL`).run(
+      now,
+      userId
+    );
+  }
 }
 
 function isHttpsRequest(req?: Request): boolean {
@@ -187,19 +205,19 @@ export interface AuthenticatedRequest extends Request {
 export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   const token = extractTokenFromRequest(req);
   if (!token) {
-    res.status(401).json({ error: 'Sesi tidak ditemukan. Silakan masuk terlebih dahulu.' });
+    res.status(401).json({ error: 'Silakan login terlebih dahulu.' });
     return;
   }
   const user = authenticateToken(token);
   if (!user) {
-    res.status(401).json({ error: 'Sesi berakhir atau akun tidak aktif. Silakan masuk ulang.' });
+    res.status(401).json({ error: 'Sesi berakhir. Silakan login kembali.' });
     return;
   }
   // CSRF check for cookie-based state-changing requests
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !req.headers.authorization) {
     const requestedWith = req.headers['x-requested-with'];
     if (requestedWith !== 'AZRIL-CLAS') {
-      res.status(403).json({ error: 'Permintaan tidak valid (header verifikasi hilang).' });
+      res.status(403).json({ error: 'Permintaan ditolak (verifikasi keamanan tidak cocok).' });
       return;
     }
   }
@@ -211,7 +229,7 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
 export function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   requireAuth(req, res, () => {
     if (req.authUser?.role !== 'ADMIN') {
-      res.status(403).json({ error: 'Akses ditolak. Khusus role Admin.' });
+      res.status(403).json({ error: 'Akses ditolak. Khusus Admin.' });
       return;
     }
     next();
@@ -221,7 +239,7 @@ export function requireAdmin(req: AuthenticatedRequest, res: Response, next: Nex
 export function requireStudent(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   requireAuth(req, res, () => {
     if (req.authUser?.role !== 'MAHASISWA' || !req.authUser.studentId) {
-      res.status(403).json({ error: 'Akses ditolak. Khusus akun Mahasiswa.' });
+      res.status(403).json({ error: 'Akses ditolak. Khusus Mahasiswa.' });
       return;
     }
     next();
@@ -242,14 +260,93 @@ export function logAdminActivity(
 }
 
 export function hasAnyAdmin(): boolean {
-  const row = db.prepare(`SELECT COUNT(*) AS cnt FROM user_profiles WHERE role = 'ADMIN'`).get() as { cnt: number };
+  const row = db
+    .prepare(`SELECT COUNT(*) AS cnt FROM user_profiles WHERE role = 'ADMIN' AND is_active = 1`)
+    .get() as { cnt: number };
   return row.cnt > 0;
+}
+
+export async function pushAdminToSupabaseIfConfigured(adminId: string): Promise<void> {
+  const supabase = getSupabaseAdminClient();
+  if (!supabase) return;
+  try {
+    const row = db
+      .prepare(
+        `SELECT id, username, email, password_hash, full_name, role, is_active
+         FROM user_profiles
+         WHERE id = ? AND role = 'ADMIN'
+         LIMIT 1`
+      )
+      .get(adminId) as
+      | {
+          id: string;
+          username: string;
+          email: string | null;
+          password_hash: string;
+          full_name: string;
+          role: string;
+          is_active: number;
+        }
+      | undefined;
+    if (!row) return;
+    await supabase.from('user_profiles').upsert(
+      {
+        id: row.id,
+        username: row.username,
+        email: row.email,
+        password_hash: row.password_hash,
+        full_name: row.full_name,
+        role: 'ADMIN',
+        is_active: Number(row.is_active) === 1,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'username' }
+    );
+  } catch {
+    // Graceful fallback if Supabase schema hasn't been initialized yet
+  }
+}
+
+export async function syncAdminFromSupabaseIfNeeded(): Promise<void> {
+  if (hasAnyAdmin()) return;
+  const supabase = getSupabaseAdminClient();
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .select('id, username, email, password_hash, full_name, is_active')
+      .eq('role', 'ADMIN')
+      .eq('is_active', true)
+      .order('created_at', { ascending: true })
+      .limit(1);
+    if (error || !data || data.length === 0) return;
+    const remote = data[0] as {
+      id: string;
+      username: string;
+      email: string | null;
+      password_hash: string | null;
+      full_name: string;
+    };
+    if (!remote.password_hash) return;
+    db.prepare(
+      `INSERT OR IGNORE INTO user_profiles (id, username, email, password_hash, full_name, role, is_active)
+       VALUES (?, ?, ?, ?, ?, 'ADMIN', 1)`
+    ).run(
+      remote.id,
+      remote.username.toLowerCase(),
+      remote.email ? remote.email.toLowerCase() : null,
+      remote.password_hash,
+      remote.full_name || 'Administrator Utama'
+    );
+  } catch {
+    // Graceful fallback if Supabase is unreachable or schema not initialized
+  }
 }
 
 export function syncEnvBootstrapAdminIfNeeded(): void {
   const envPass = process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim();
-  const envUser = (process.env.ADMIN_BOOTSTRAP_USERNAME?.trim() || 'azriel-admin').toLowerCase();
-  const envEmail = (process.env.ADMIN_BOOTSTRAP_EMAIL?.trim() || 'azrilalafriza5@gmail.com').toLowerCase();
+  const envUser = (process.env.ADMIN_BOOTSTRAP_USERNAME?.trim() || CANONICAL_ADMIN_USERNAME).toLowerCase();
+  const envEmail = (process.env.ADMIN_BOOTSTRAP_EMAIL?.trim() || CANONICAL_ADMIN_EMAIL).toLowerCase();
   if (!envPass) return;
 
   // Enforce a single canonical ADMIN account: prefer matching by env username/email, else oldest ADMIN
@@ -311,4 +408,5 @@ export function syncEnvBootstrapAdminIfNeeded(): void {
 
   // Deactivate any extra legacy ADMIN accounts so strictly 1 Admin account can log in
   db.prepare(`UPDATE user_profiles SET is_active = 0 WHERE role = 'ADMIN' AND id != ?`).run(activeAdminId);
+  void pushAdminToSupabaseIfConfigured(activeAdminId);
 }

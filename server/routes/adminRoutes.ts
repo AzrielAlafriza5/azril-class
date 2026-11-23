@@ -4,7 +4,15 @@ import path from 'node:path';
 import { Router } from 'express';
 import multer from 'multer';
 import QRCode from 'qrcode';
-import { hashPassword, logAdminActivity, requireAdmin, type AuthenticatedRequest } from '../auth.ts';
+import {
+  hashPassword,
+  logAdminActivity,
+  pushAdminToSupabaseIfConfigured,
+  requireAdmin,
+  revokeOtherSessions,
+  verifyPassword,
+  type AuthenticatedRequest,
+} from '../auth.ts';
 import { db, newId, UPLOADS_DIR, withTransaction } from '../db/database.ts';
 import { analyzeSubmissionWithGemini, isGeminiConfigured } from '../services/aiService.ts';
 import {
@@ -2382,4 +2390,60 @@ adminRouter.get('/audit-logs', (_req, res) => {
     )
     .all();
   res.json({ items });
+});
+
+adminRouter.post('/change-password', async (req: AuthenticatedRequest, res) => {
+  if (process.env.ADMIN_BOOTSTRAP_PASSWORD?.trim()) {
+    res.status(409).json({
+      error: 'Password Admin saat ini dikelola melalui pengaturan Secrets / Environment server agar tetap permanen.',
+    });
+    return;
+  }
+
+  const { currentPassword, newPassword } = req.body as {
+    currentPassword?: string;
+    newPassword?: string;
+  };
+  const rawCurrent = String(currentPassword ?? '');
+  const trimmedCurrent = rawCurrent.trim();
+  const nextPass = String(newPassword ?? '').trim();
+
+  if (!trimmedCurrent || !nextPass) {
+    res.status(400).json({ error: 'Password saat ini dan password baru wajib diisi.' });
+    return;
+  }
+  if (nextPass.length < 6) {
+    res.status(400).json({ error: 'Password baru minimal 6 karakter.' });
+    return;
+  }
+
+  const adminRow = db
+    .prepare(`SELECT id, password_hash FROM user_profiles WHERE id = ? AND role = 'ADMIN' LIMIT 1`)
+    .get(req.authUser!.id) as { id: string; password_hash: string } | undefined;
+
+  if (!adminRow) {
+    res.status(404).json({ error: 'Akun Admin tidak ditemukan.' });
+    return;
+  }
+
+  const valid =
+    verifyPassword(rawCurrent, adminRow.password_hash) ||
+    (trimmedCurrent !== rawCurrent && verifyPassword(trimmedCurrent, adminRow.password_hash));
+
+  if (!valid) {
+    res.status(401).json({ error: 'Password saat ini salah.' });
+    return;
+  }
+
+  db.prepare(`UPDATE user_profiles SET password_hash = ?, updated_at = ? WHERE id = ?`).run(
+    hashPassword(nextPass),
+    new Date().toISOString(),
+    adminRow.id
+  );
+
+  await pushAdminToSupabaseIfConfigured(adminRow.id);
+  revokeOtherSessions(adminRow.id, req.authToken);
+  logAdminActivity(adminRow.id, 'ADMIN_CHANGE_PASSWORD', 'user_profiles', adminRow.id);
+
+  res.json({ ok: true });
 });

@@ -12,6 +12,7 @@ export interface ToastMessage {
 interface AuthStatusInfo {
   hasAdmin: boolean;
   envBootstrapConfigured: boolean;
+  adminUsername?: string;
   supabaseConfigured: boolean;
   geminiConfigured: boolean;
   institutionName: string;
@@ -29,6 +30,7 @@ interface AuthContextValue {
   refreshUser: () => Promise<void>;
   refreshSystemStatus: () => Promise<void>;
   loginAdmin: (identifier: string, password: string) => Promise<AuthUser>;
+  activateSingleAdmin: (password: string) => Promise<AuthUser>;
   loginStudent: (username: string, password: string) => Promise<{
     user: AuthUser;
     loginReward?: { xpAwarded: number; streakBonusAwarded: number; currentStreak: number };
@@ -92,6 +94,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return res.user;
   };
 
+  const activateSingleAdmin = async (password: string) => {
+    const res = await apiRequest<{ token: string; user: AuthUser }>('/api/auth/admin/activate', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    });
+    setAuthToken(res.token);
+    setUser(res.user);
+    await refreshSystemStatus();
+    return res.user;
+  };
+
   const loginStudent = async (username: string, password: string) => {
     const res = await apiRequest<{
       token: string;
@@ -128,6 +141,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         refreshUser,
         refreshSystemStatus,
         loginAdmin,
+        activateSingleAdmin,
         loginStudent,
         logout,
       }}
